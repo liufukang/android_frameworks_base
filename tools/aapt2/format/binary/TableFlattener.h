@@ -21,6 +21,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "Resource.h"
 #include "ResourceTable.h"
@@ -82,6 +83,17 @@ struct TableFlattenerOptions {
 
   // Map from original resource ids to obfuscated names.
   std::unordered_map<uint32_t, std::string> id_resource_map;
+
+  // Legacy 0x7F 资源条目（用于双 PackageChunk 输出）
+  struct LegacyPublicEntry {
+    std::string type_name;
+    std::string entry_name;
+    uint8_t type_id;
+    uint16_t entry_id;
+  };
+  std::vector<LegacyPublicEntry> legacy_entries;
+  // Legacy 包的包名（通常与目标包相同）
+  std::string legacy_package_name;
 };
 
 class TableFlattener : public IResourceTableConsumer {
@@ -93,6 +105,11 @@ class TableFlattener : public IResourceTableConsumer {
   bool Consume(IAaptContext* context, ResourceTable* table) override;
 
  private:
+  // 构建并 flatten legacy 0x7F PackageChunk
+  bool FlattenLegacyPackage(IAaptContext* context, ResourceTable* table,
+                            const ResourceTableView& table_view,
+                            android::BigBuffer* package_buffer);
+
   TableFlattenerOptions options_;
   android::BigBuffer* buffer_;
 
