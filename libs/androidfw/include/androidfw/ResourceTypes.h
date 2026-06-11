@@ -505,7 +505,7 @@ struct ResStringPool_span
 
     // The range of characters in the string that this span applies to.
     uint32_t firstChar, lastChar;
-};
+} __attribute__((__packed__, aligned(1)));
 
 /**
  * Convenience class for accessing data in a ResStringPool resource.
