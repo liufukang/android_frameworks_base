@@ -90,6 +90,9 @@ class SymbolTable {
   // results are stored in a cache which may evict entries on subsequent calls.
   const Symbol* FindByName(const ResourceName& name);
 
+  // 跳过 name mangling 直接搜索，用于跨包非限定资源引用的回退查找
+  const Symbol* FindByNameNoMangle(const ResourceName& name);
+
   // NOTE: Never hold on to the result between calls to FindByXXX. The
   // results are stored in a cache which may evict entries on subsequent calls.
   const Symbol* FindById(const ResourceId& id);
@@ -100,6 +103,42 @@ class SymbolTable {
   // results are stored in a cache which may evict entries on subsequent calls.
   const Symbol* FindByReference(const Reference& ref);
 
+  // 设置是否在非限定引用查找失败时搜索所有 include 包
+  void SetSearchAllIncludePackages(bool val) {
+    search_all_include_packages_ = val;
+  }
+
+  bool GetSearchAllIncludePackages() const {
+    return search_all_include_packages_;
+  }
+
+  // 设置所有 -I 加载的 include 包名（不含 "android"）
+  void SetIncludePackageNames(std::vector<std::string> names) {
+    include_package_names_ = std::move(names);
+  }
+
+  const std::vector<std::string>& GetIncludePackageNames() const {
+    return include_package_names_;
+  }
+
+  // 设置是否禁用资源可见性检查（默认 true，允许引用非 PUBLIC 资源）
+  void SetDisableVisibilityCheck(bool val) {
+    disable_visibility_check_ = val;
+  }
+
+  bool GetDisableVisibilityCheck() const {
+    return disable_visibility_check_;
+  }
+
+  // 记录通过 fallback 解析到的 0x7F 资源（用于后续添加到 ResourceTable 生成 R 类字段）
+  void RecordFallbackResolvedEntry(const ResourceName& name, ResourceId id) {
+    fallback_resolved_entries_.emplace_back(name, id);
+  }
+
+  const std::vector<std::pair<ResourceName, ResourceId>>& GetFallbackResolvedEntries() const {
+    return fallback_resolved_entries_;
+  }
+
  private:
   NameMangler* mangler_;
   std::unique_ptr<ISymbolTableDelegate> delegate_;
@@ -109,6 +148,16 @@ class SymbolTable {
   // we need automatic deletion.
   android::LruCache<ResourceName, std::shared_ptr<Symbol>> cache_;
   android::LruCache<ResourceId, std::shared_ptr<Symbol>> id_cache_;
+
+  // 跨包非限定资源引用回退搜索配置
+  bool search_all_include_packages_ = false;
+  std::vector<std::string> include_package_names_;
+
+  // 禁用资源可见性检查（默认 true，允许引用 -I 包中的非 PUBLIC 资源）
+  bool disable_visibility_check_ = true;
+
+  // fallback 解析到的 0x7F 资源列表
+  std::vector<std::pair<ResourceName, ResourceId>> fallback_resolved_entries_;
 
   DISALLOW_COPY_AND_ASSIGN(SymbolTable);
 };
@@ -194,6 +243,8 @@ class AssetManagerSymbolSource : public ISymbolSource {
 
   bool AddAssetPath(android::StringPiece path);
   std::map<size_t, std::string> GetAssignedPackageIds() const;
+  // 获取所有 include 包中不同的包名（包括同一 PackageGroup 中的不同名字）
+  std::vector<std::string> GetAllPackageNames() const;
   bool IsPackageDynamic(uint32_t packageId, const std::string& package_name) const;
 
   std::unique_ptr<SymbolTable::Symbol> FindByName(
@@ -201,6 +252,10 @@ class AssetManagerSymbolSource : public ISymbolSource {
   std::unique_ptr<SymbolTable::Symbol> FindById(ResourceId id) override;
   std::unique_ptr<SymbolTable::Symbol> FindByReference(
       const Reference& ref) override;
+
+  // 获取所有 0x7F include 包中的资源列表（name + 原始 ID）
+  // 用于在 link 阶段预填充到 host ResourceTable，使 IdAssigner 分配 host 体系 ID
+  std::vector<std::pair<ResourceName, ResourceId>> GetAll7fResources() const;
 
   android::AssetManager2* GetAssetManager() {
     return &asset_manager_;

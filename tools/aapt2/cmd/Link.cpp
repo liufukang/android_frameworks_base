@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <queue>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -768,6 +769,115 @@ class Linker {
         file_collection_(util::make_unique<io::FileCollection>()) {
   }
 
+  // 解析 --type-id-mapping 和 --entry-slot-config 参数
+  bool ParseBundleOptions() {
+    // 解析 --type-id-mapping
+    if (options_.type_id_mapping) {
+      for (StringPiece pair : util::Tokenize(options_.type_id_mapping.value(), ',')) {
+        pair = util::TrimWhitespace(pair);
+        if (pair.empty()) continue;
+        auto eq_pos = pair.find('=');
+        if (eq_pos == StringPiece::npos) {
+          context_->GetDiagnostics()->Error(android::DiagMessage()
+              << "invalid --type-id-mapping pair: '" << pair << "', expected type=id");
+          return false;
+        }
+        std::string type_name(pair.substr(0, eq_pos));
+        std::string id_str(pair.substr(eq_pos + 1));
+        auto maybe_id = ResourceUtils::ParseInt(id_str);
+        if (!maybe_id || maybe_id.value() == 0 || maybe_id.value() > 255) {
+          context_->GetDiagnostics()->Error(android::DiagMessage()
+              << "invalid type ID '" << id_str << "' for type '" << type_name
+              << "' in --type-id-mapping (must be 1-255)");
+          return false;
+        }
+        // ?N 标准化为 ^attr-private
+        if (type_name.size() > 1 && type_name[0] == '?') {
+          bool all_digits = true;
+          for (size_t i = 1; i < type_name.size(); i++) {
+            if (!std::isdigit(type_name[i])) { all_digits = false; break; }
+          }
+          if (all_digits) type_name = "^attr-private";
+        }
+        type_id_mapping_table_[type_name] = static_cast<uint8_t>(maybe_id.value());
+      }
+      context_->GetDiagnostics()->Note(android::DiagMessage()
+          << "--type-id-mapping: " << type_id_mapping_table_.size() << " type mappings loaded");
+    }
+
+    // 解析 --entry-slot-config
+    if (options_.entry_slot_config) {
+      for (StringPiece slot_str : util::Tokenize(options_.entry_slot_config.value(), ',')) {
+        slot_str = util::TrimWhitespace(slot_str);
+        if (slot_str.empty()) continue;
+        auto maybe_slot = ResourceUtils::ParseInt(std::string(slot_str));
+        if (!maybe_slot || (int)maybe_slot.value() < 0) {
+          context_->GetDiagnostics()->Error(android::DiagMessage()
+              << "invalid slot '" << slot_str << "' in --entry-slot-config");
+          return false;
+        }
+        entry_slots_.push_back((int)maybe_slot.value());
+      }
+      context_->GetDiagnostics()->Note(android::DiagMessage()
+          << "--entry-slot-config: slots=" << options_.entry_slot_config.value());
+    }
+
+    // 解析 --legacy-public-xml
+    if (options_.legacy_public_xml_path) {
+      const std::string& path = options_.legacy_public_xml_path.value();
+      auto xml = LoadXml(path, context_->GetDiagnostics());
+      if (!xml) {
+        context_->GetDiagnostics()->Error(android::DiagMessage()
+            << "failed to parse --legacy-public-xml: " << path);
+        return false;
+      }
+      xml::Element* root_el = xml::FindRootElement(xml->root.get());
+      if (!root_el || root_el->name != "resources") {
+        context_->GetDiagnostics()->Error(android::DiagMessage()
+            << "--legacy-public-xml root element must be <resources>, got: "
+            << (root_el ? root_el->name : "(null)"));
+        return false;
+      }
+      for (const xml::Element* child_el : root_el->GetChildElements()) {
+        if (child_el->name != "public") continue;
+        const xml::Attribute* type_attr = child_el->FindAttribute({}, "type");
+        const xml::Attribute* name_attr = child_el->FindAttribute({}, "name");
+        const xml::Attribute* id_attr = child_el->FindAttribute({}, "id");
+        if (!type_attr || !name_attr || !id_attr) {
+          context_->GetDiagnostics()->Error(android::DiagMessage(android::Source(path).WithLine(child_el->line_number))
+              << "<public> element requires type, name, and id attributes");
+          return false;
+        }
+        auto maybe_id = ResourceUtils::ParseInt(id_attr->value);
+        if (!maybe_id) {
+          context_->GetDiagnostics()->Error(android::DiagMessage(android::Source(path).WithLine(child_el->line_number))
+              << "invalid resource ID: " << id_attr->value);
+          return false;
+        }
+        uint32_t full_id = static_cast<uint32_t>(maybe_id.value());
+        uint8_t pkg_id = (full_id >> 24) & 0xFF;
+        if (pkg_id != 0x7F) {
+          context_->GetDiagnostics()->Error(android::DiagMessage(android::Source(path).WithLine(child_el->line_number))
+              << "legacy public entry must have package ID 0x7F, got: "
+              << StringPrintf("0x%02x", pkg_id));
+          return false;
+        }
+        uint8_t type_id= (full_id >> 16) & 0xFF;
+        uint16_t entry_id = full_id & 0xFFFF;
+        TableFlattenerOptions::LegacyPublicEntry entry;
+        entry.type_name = type_attr->value;
+        entry.entry_name = name_attr->value;
+        entry.type_id = type_id;
+        entry.entry_id = entry_id;
+        legacy_entries_.push_back(std::move(entry));
+      }
+      context_->GetDiagnostics()->Note(android::DiagMessage()
+          << "--legacy-public-xml: " << legacy_entries_.size() << " entries loaded from " << path);
+    }
+
+    return true;
+  }
+
   void ExtractCompileSdkVersions(android::AssetManager2* assets) {
     using namespace android;
 
@@ -897,6 +1007,7 @@ class Linker {
 
     // Capture the shared libraries so that the final resource table can be properly flattened
     // with support for shared libraries.
+    std::vector<std::string> include_pkg_names;
     for (auto& entry : asset_source->GetAssignedPackageIds()) {
       if (entry.first == kAppPackageId) {
         // Capture the included base feature package.
@@ -917,6 +1028,23 @@ class Linker {
       }
     }
 
+    // 使用 GetAllPackageNames 收集所有不同的包名（包括同一 PackageGroup 中的不同名字），
+    // 确保多个 bundle 共享同一 packageId 但使用不同包名时都能被搜索到
+    if (options_.search_all_include_packages) {
+      include_pkg_names = asset_source->GetAllPackageNames();
+      // 移除 android 包
+      include_pkg_names.erase(
+          std::remove(include_pkg_names.begin(), include_pkg_names.end(), "android"),
+          include_pkg_names.end());
+      context_->GetExternalSymbols()->SetSearchAllIncludePackages(true);
+      context_->GetExternalSymbols()->SetIncludePackageNames(std::move(include_pkg_names));
+    }
+
+    // 设置可见性检查开关（默认 true 表示禁用检查，允许引用非 PUBLIC 资源）
+    context_->GetExternalSymbols()->SetDisableVisibilityCheck(options_.disable_visibility_check);
+
+    // 保存裸指针用于在 IdAssigner 前预填充 0x7F 资源
+    asset_source_ptr_ = asset_source.get();
     context_->GetExternalSymbols()->AppendSource(std::move(asset_source));
     return true;
   }
@@ -1920,6 +2048,12 @@ class Linker {
       }
     }
 
+    // 将 legacy 0x7F 资源条目传递给 TableFlattener
+    if (!legacy_entries_.empty()) {
+      options_.table_flattener_options.legacy_entries = legacy_entries_;
+      options_.table_flattener_options.legacy_package_name = context_->GetCompilationPackage();
+    }
+
     bool success = FlattenTable(table, options_.output_format, writer);
 
     if (package_to_rewrite != nullptr) {
@@ -1941,6 +2075,12 @@ class Linker {
 
   int Run(const std::vector<std::string>& input_files) {
     TRACE_CALL();
+
+    // 解析 bundle 相关参数（--type-id-mapping, --entry-slot-config）
+    if (!ParseBundleOptions()) {
+      return 1;
+    }
+
     // Load the AndroidManifest.xml
     std::unique_ptr<xml::XmlResource> manifest_xml =
         LoadXml(options_.manifest_path, context_->GetDiagnostics());
@@ -2069,11 +2209,104 @@ class Linker {
         return 1;
       }
 
-      // Assign IDs if we are building a regular app.
-      IdAssigner id_assigner(&options_.stable_id_map);
+      // 注意：不在 AAPT2 Link 阶段预填充 bundle 资源到宿主 ResourceTable。
+      // bundle 资源的 entry 位置由 Portal 侧 HostEntryRearranger + MergeBundleResourcesTask
+      // 在合并阶段处理。预填充会导致空 entry 占位，影响 IdAssigner 对宿主自身资源的 ID 分配，
+      // 造成 R 类内联常量与 arsc 不一致。与普通 aar 集成行为保持一致（宿主优先）。
+
+      // 从 legacy_entries_ 构建 entry name 集合
+      std::set<std::pair<std::string, std::string>> legacy_entry_names;
+      for (const auto& le : legacy_entries_) {
+        legacy_entry_names.insert({le.type_name, le.entry_name});
+      }
+
+      // 从 ResourceTable 中移除 legacy entry，避免 IdAssigner 为其分配 target 包 ID
+      // 导致与 non-legacy entry 碰撞（legacy entry 可能超出 slot 容量，且其 entry ID
+      // 与 non-legacy 的自动分配 ID 冲突）。移除后的 entry 保存在 extracted_legacy_entries 中，
+      // IdAssigner 完成后恢复。
+      struct ExtractedLegacyEntry {
+        size_t pkg_idx;
+        size_t type_idx;
+        std::unique_ptr<ResourceEntry> entry;
+      };
+      std::vector<ExtractedLegacyEntry> extracted_legacy_entries;
+
+      if (!legacy_entry_names.empty()) {
+        for (size_t pi = 0; pi < final_table_.packages.size(); pi++) {
+          auto& package = final_table_.packages[pi];
+          for (size_t ti = 0; ti < package->types.size(); ti++) {
+            auto& type = package->types[ti];
+            std::string type_name = type->named_type.to_string();
+            auto& entries = type->entries;
+            auto it = entries.begin();
+            while (it != entries.end()) {
+              if (legacy_entry_names.count({type_name, std::string((*it)->name)}) > 0) {
+                extracted_legacy_entries.push_back({pi, ti, std::move(*it)});
+                it = entries.erase(it);
+              } else {
+                ++it;
+              }
+            }
+          }
+        }
+        context_->GetDiagnostics()->Note(android::DiagMessage()
+            << "extracted " << extracted_legacy_entries.size()
+            << " legacy entries before IdAssigner");
+      }
+
+      // IdAssigner 只分配 non-legacy entry 的 ID，不产生碰撞
+      IdAssigner id_assigner(
+          &options_.stable_id_map,
+          type_id_mapping_table_.empty() ? nullptr : &type_id_mapping_table_,
+          entry_slots_.empty() ? nullptr : &entry_slots_,
+          nullptr);  // 无 legacy_entry_names，因为 legacy entry 已从 table 中移除
       if (!id_assigner.Consume(context_, &final_table_)) {
         context_->GetDiagnostics()->Error(android::DiagMessage() << "failed assigning IDs");
         return 1;
+      }
+
+      // 恢复 legacy entry 到 ResourceTable，并设置 0x7F 包的 ID。
+      // ReferenceLinker（在此之后运行）需要这些 entry 在 table 中以解析引用。
+      // 使用 0x7F 作为 package ID（而非 target packageId），这样 ReferenceLinker
+      // 解析后的引用值直接指向 0x7F 包中的 entry，运行时无需额外重映射。
+      // FlattenLegacyPackage 从 table_view 读取 legacy entry 数据构建 0x7F 包。
+      // target 包在 flatten 时会过滤掉 legacy entry（TableFlattener 负责）。
+      if (!extracted_legacy_entries.empty()) {
+        std::map<std::pair<std::string, std::string>, ResourceId> legacy_id_map;
+        for (const auto& le : legacy_entries_) {
+          // 使用 0x7F 作为 package ID，使引用直接指向 0x7F 包
+          legacy_id_map[{le.type_name, le.entry_name}] =
+              ResourceId(kAppPackageId, le.type_id, le.entry_id);
+        }
+
+        size_t restored = 0;
+        std::set<std::pair<size_t, size_t>> affected_types;
+        for (auto& extracted : extracted_legacy_entries) {
+          auto& package = final_table_.packages[extracted.pkg_idx];
+          auto& type = package->types[extracted.type_idx];
+          std::string type_name = type->named_type.to_string();
+
+          // 设置 legacy 声明的 ID
+          auto id_it = legacy_id_map.find({type_name, std::string(extracted.entry->name)});
+          if (id_it != legacy_id_map.end()) {
+            extracted.entry->id = id_it->second;
+          }
+
+          type->entries.push_back(std::move(extracted.entry));
+          affected_types.insert({extracted.pkg_idx, extracted.type_idx});
+          restored++;
+        }
+
+        // entries 数组必须按 name 排序（FindEntry 使用二分查找）
+        for (const auto& [pi, ti] : affected_types) {
+          auto& entries = final_table_.packages[pi]->types[ti]->entries;
+          std::sort(entries.begin(), entries.end(),
+              [](const std::unique_ptr<ResourceEntry>& a, const std::unique_ptr<ResourceEntry>& b) {
+                return a->name < b->name;
+              });
+        }
+        context_->GetDiagnostics()->Note(android::DiagMessage()
+            << "restored " << restored << " legacy entries with declared IDs");
       }
 
       // Now grab each ID and emit it as a file.
@@ -2383,6 +2616,16 @@ class Linker {
 
   // The package name of the base application, if it is included.
   std::optional<std::string> included_feature_base_;
+
+  // 保存 AssetManagerSymbolSource 指针，用于在 IdAssigner 前预填充 0x7F 资源
+  AssetManagerSymbolSource* asset_source_ptr_ = nullptr;
+
+  // 解析后的全局 Type ID 映射表
+  std::map<std::string, uint8_t> type_id_mapping_table_;
+  // 解析后的 Entry ID slot 配置
+  std::vector<int> entry_slots_;
+  // 解析后的 legacy 0x7F 资源条目
+  std::vector<TableFlattenerOptions::LegacyPublicEntry> legacy_entries_;
 };
 
 int LinkCommand::Action(const std::vector<std::string>& args) {
