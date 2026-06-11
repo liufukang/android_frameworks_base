@@ -6,3 +6,7 @@ gen/
 .vscode/
 *.code-workspace
 .gradle/
+
+# protoc 生成的中间文件
+*.pb.cc
+*.pb.h
