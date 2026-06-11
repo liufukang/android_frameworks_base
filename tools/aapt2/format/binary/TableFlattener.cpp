@@ -16,7 +16,9 @@
 
 #include "format/binary/TableFlattener.h"
 
+#include <algorithm>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <type_traits>
 #include <variant>
@@ -120,7 +122,9 @@ class PackageFlattener {
     buffer->AppendBuffer(std::move(type_buffer));
 
     // If there are libraries (or if the package ID is 0x00), encode a library chunk.
-    if (package_.id.value() == 0x00 || !shared_libs_->empty()) {
+    // 扩展：非标准 packageId（非 0x01/0x7F）也注入 LibraryChunk 用于 DynamicRefTable 解析
+    if (package_.id.value() == 0x00 || !shared_libs_->empty() ||
+        (package_.id.value() != kFrameworkPackageId && package_.id.value() != kAppPackageId)) {
       FlattenLibrarySpec(buffer);
     }
 
@@ -525,15 +529,28 @@ class PackageFlattener {
     ResTable_lib_header* lib_header =
         lib_writer.StartChunk<ResTable_lib_header>(RES_TABLE_LIBRARY_TYPE);
 
-    const size_t num_entries = (package_.id.value() == 0x00 ? 1 : 0) + shared_libs_->size();
+   // 计算条目数量：动态包自身 + 非标准 packageId 自身映射 + 共享库引用
+    const bool is_dynamic = (package_.id.value() == 0x00);
+    const bool is_non_standard = (!is_dynamic &&
+        package_.id.value() != kFrameworkPackageId &&
+        package_.id.value() != kAppPackageId);
+    const size_t num_entries = (is_dynamic ? 1 : 0) + (is_non_standard ? 1 : 0) + shared_libs_->size();
     CHECK(num_entries > 0);
 
     lib_header->count = android::util::HostToDevice32(num_entries);
 
     ResTable_lib_entry* lib_entry = buffer->NextBlock<ResTable_lib_entry>(num_entries);
-    if (package_.id.value() == 0x00) {
+    if (is_dynamic) {
       // Add this package
       lib_entry->packageId = android::util::HostToDevice32(0x00);
+      strcpy16_htod(lib_entry->packageName, arraysize(lib_entry->packageName),
+                    android::util::Utf8ToUtf16(package_.name));
+      ++lib_entry;
+    }
+
+    // 非标准 packageId 的自身映射（如 bundle 的 0x50）
+    if (is_non_standard) {
+      lib_entry->packageId = android::util::HostToDevice32(package_.id.value());
       strcpy16_htod(lib_entry->packageName, arraysize(lib_entry->packageName),
                     android::util::Utf8ToUtf16(package_.name));
       ++lib_entry;
@@ -578,11 +595,18 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
       });
 
   // Write the ResTable header.
-  const auto& table_view =
+  auto table_view =
       table->GetPartitionedView(ResourceTableViewOptions{.create_alias_entries = true});
   ChunkWriter table_writer(buffer_);
   ResTable_header* table_header = table_writer.StartChunk<ResTable_header>(RES_TABLE_TYPE);
-  table_header->packageCount = android::util::HostToDevice32(table_view.packages.size());
+
+  // 计算 packageCount：GetPartitionedView 会将 legacy entry（id=0x7F...）
+  // 分配到一个独立的 0x7F PackageView。我们跳过这个 view（用 FlattenLegacyPackage
+  // 手动构建），但 packageCount 仍然等于 table_view.packages.size()，
+  // 因为 0x7F PackageView 被跳过后由手动构建的 legacy 包替代（数量不变）。
+  // 如果没有 legacy entries，则 table_view 中不会有 0x7F PackageView，也不需要额外 +1。
+  uint32_t total_packages = table_view.packages.size();
+  table_header->packageCount = android::util::HostToDevice32(total_packages);
 
   // Flatten the values string pool.
   android::StringPool::FlattenUtf8(table_writer.buffer(), table->string_pool,
@@ -590,8 +614,57 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
 
   android::BigBuffer package_buffer(1024);
 
-  // Flatten each package.
+  // 先 flatten legacy 0x7F PackageChunk（在过滤 target 包之前，因为 legacy 包需要从 target 查找 entry 值）
+  if (!options_.legacy_entries.empty() && !table_view.packages.empty()) {
+    if (!FlattenLegacyPackage(context, table, table_view, &package_buffer)) {
+      return false;
+    }
+  }
+
+  // 从 target 包中排除 legacy entry：
+  // Link.cpp 在 IdAssigner 前移除了 legacy entry（避免 ID 碰撞），之后恢复了 legacy entry
+  // 并设置了 legacy 声明的 ID（供 ReferenceLinker 解析引用）。
+  // GetPartitionedView 按 entry->id 的 package_id 分配到不同 PackageView：
+  //   - legacy entry（id=0x7F...）→ 0x7F PackageView
+  //   - non-legacy entry（id=0x50...）→ 0x50 PackageView
+  // target 包（0x50）不应包含 legacy entry（它们只存在于 0x7F 包），
+  // 此处从非 0x7F 的 PackageView 中过滤掉 legacy entry（如有残留）。
+  // 0x7F PackageView 本身会被整体跳过（FlattenLegacyPackage 已手动构建）。
+  if (!options_.legacy_entries.empty()) {
+    std::set<std::pair<std::string, std::string>> legacy_names;
+    for (const auto& le : options_.legacy_entries) {
+      legacy_names.insert({le.type_name, le.entry_name});
+    }
+    for (auto& package : table_view.packages) {
+      // 跳过 0x7F PackageView——其中的 entry 由 FlattenLegacyPackage 处理
+      if (package.id.has_value() && package.id.value() == kAppPackageId) {
+        continue;
+      }
+      for (auto it = package.types.begin(); it != package.types.end(); ) {
+        std::string type_name = it->named_type.to_string();
+        auto& entries = it->entries;
+        entries.erase(
+            std::remove_if(entries.begin(), entries.end(),
+                [&](const ResourceTableEntryView& e) {
+                  return legacy_names.count({type_name, std::string(e.name)}) > 0;
+                }),
+            entries.end());
+        if (entries.empty()) {
+          it = package.types.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+
+  // Flatten each package (target 包，legacy entries 已排除; 跳过 0x7F 包).
   for (auto& package : table_view.packages) {
+    // 跳过 0x7F PackageView——已通过 FlattenLegacyPackage 手动构建
+    if (!options_.legacy_entries.empty() && package.id.has_value() &&
+        package.id.value() == kAppPackageId) {
+      continue;
+    }
     if (context->GetPackageType() == PackageType::kApp) {
       // Write a self mapping entry for this package if the ID is non-standard (0x7f).
       CHECK((bool)package.id) << "Resource ids have not been assigned before flattening the table";
@@ -623,6 +696,140 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
   // Finally merge all the packages into the main buffer.
   table_writer.buffer()->AppendBuffer(std::move(package_buffer));
   table_writer.Finish();
+  return true;
+}
+
+bool TableFlattener::FlattenLegacyPackage(IAaptContext* context, ResourceTable* table,
+                                           const ResourceTableView& table_view,
+                                           android::BigBuffer* package_buffer) {
+  // 按 type_name 分组 legacy entries
+  struct LegacyTypeInfo {
+    uint8_t type_id;
+    std::vector<const TableFlattenerOptions::LegacyPublicEntry*> entries;
+  };
+  std::map<std::string, LegacyTypeInfo> legacy_types;
+  for (const auto& le : options_.legacy_entries) {
+    auto& ti = legacy_types[le.type_name];
+    ti.type_id = le.type_id;
+    ti.entries.push_back(&le);
+  }
+
+  // 找到源 package（目标包）
+  const ResourceTablePackageView* src_pkg = nullptr;
+  for (const auto& pkg : table_view.packages) {
+    if (pkg.id.has_value() && pkg.id.value() != kFrameworkPackageId &&
+        pkg.id.value() != kAppPackageId) {
+      src_pkg = &pkg;
+      break;
+    }
+  }
+  if (!src_pkg && !table_view.packages.empty()) {
+    src_pkg = &table_view.packages[0];
+  }
+  if (!src_pkg) {
+    context->GetDiagnostics()->Error(android::DiagMessage()
+        << "no source package found for legacy 0x7F package construction");
+    return false;
+  }
+
+  // 构建从 (type_name, entry_name) 到 source entry view 的索引。
+  // 由于 legacy entry 的 id 以 0x7F 为 package_id，GetPartitionedView 会将它们
+  // 放到一个独立的 0x7F PackageView 中（而非 target 包的 view），
+  // 所以需要从所有 packages 中收集 entry，确保能找到 legacy entry 的 values。
+  std::map<std::pair<std::string, std::string>, const ResourceTableEntryView*> src_entry_index;
+  for (const auto& pkg : table_view.packages) {
+    for (const auto& type : pkg.types) {
+      std::string type_name = type.named_type.to_string();
+      for (const auto& entry : type.entries) {
+        src_entry_index[{type_name, entry.name}] = &entry;
+      }
+    }
+  }
+
+  // 构建 legacy 0x7F PackageView
+  ResourceTablePackageView legacy_pkg;
+  legacy_pkg.name = options_.legacy_package_name.empty()
+      ? src_pkg->name : options_.legacy_package_name;
+  legacy_pkg.id = kAppPackageId;  // 0x7F
+
+  // 按 type_id 排序构建 types
+  std::map<uint8_t, ResourceTableTypeView> type_map;
+  for (const auto& [type_name, type_info] : legacy_types) {
+    auto& type_view = type_map[type_info.type_id];
+    if (!type_view.id.has_value()) {
+      type_view.id = type_info.type_id;
+      type_view.named_type = ResourceNamedTypeWithDefaultName(ResourceType::kRaw).ToResourceNamedType();
+      // 从所有 packages 中查找正确的 named_type（legacy entry 可能在 0x7F PackageView 中）
+      bool found_type = false;
+      for (const auto& pkg : table_view.packages) {
+        for (const auto& src_type : pkg.types) {
+          if (src_type.named_type.to_string() == type_name) {
+            type_view.named_type = src_type.named_type;
+            found_type = true;
+            break;
+          }
+        }
+        if (found_type) break;
+      }
+      // 所有 legacy 资源标记为 public
+      type_view.visibility_level = Visibility::Level::kPublic;
+    }
+
+    // 添加 entries
+    for (const auto* le : type_info.entries) {
+      auto src_it = src_entry_index.find({le->type_name, le->entry_name});
+      if (src_it == src_entry_index.end()) {
+        context->GetDiagnostics()->Warn(android::DiagMessage()
+            << "legacy entry " << le->type_name << "/" << le->entry_name
+            << " not found in source package, skipping");
+        continue;
+      }
+      // 复制 entry view，使用 legacy 的 entry_id，标记为 public
+      ResourceTableEntryView ev;
+      ev.name = src_it->second->name;
+      ev.id = le->entry_id;
+      ev.visibility.level = Visibility::Level::kPublic;
+      ev.values = src_it->second->values;
+      type_view.entries.push_back(std::move(ev));
+    }
+  }
+
+  // 按 entry_id 排序每个 type 的 entries，跳过空 type
+  for (auto& [tid, type_view] : type_map) {
+    if (type_view.entries.empty()) continue;
+    std::sort(type_view.entries.begin(), type_view.entries.end(),
+        [](const ResourceTableEntryView& a, const ResourceTableEntryView& b) {
+          return a.id.value() < b.id.value();
+        });
+    legacy_pkg.types.push_back(std::move(type_view));
+  }
+
+  // legacy 0x7F 包中的 entry value 引用仍使用 target packageId（如 0x50），
+  // 通过 LibraryChunk 注册 target→package_name 映射，
+  // 使 DynamicRefTable 能在 -I 场景下正确解析这些引用。
+  // 运行时 Portal 会将 bundle binary XML 和 arsc 中的 legacy 引用从 0x50 重映射到 0x7F，
+  // 确保 legacy entry 只通过 0x7F PackageGroup 解析。
+  ResourceTable::ReferencedPackages legacy_libs;
+  if (src_pkg->id.has_value()) {
+    legacy_libs[src_pkg->id.value()] = src_pkg->name;
+  }
+
+  // Flatten legacy 0x7F 包
+  PackageFlattener legacy_flattener(context, legacy_pkg, &legacy_libs,
+                                     SparseEntriesMode::Disabled,
+                                     false,  // compact_entries
+                                     false,  // collapse_key_stringpool
+                                     options_.name_collapse_exemptions,
+                                     false);  // deduplicate_entry_values
+  if (!legacy_flattener.FlattenPackage(package_buffer)) {
+    context->GetDiagnostics()->Error(android::DiagMessage()
+        << "failed to flatten legacy 0x7F package");
+    return false;
+  }
+
+  context->GetDiagnostics()->Note(android::DiagMessage()
+      << "legacy 0x7F package flattened with " << options_.legacy_entries.size()
+      << " entries, " << legacy_types.size() << " types");
   return true;
 }
 

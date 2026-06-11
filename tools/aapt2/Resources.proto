@@ -16,7 +16,7 @@
 
 syntax = "proto3";
 
-import "frameworks/base/tools/aapt2/Configuration.proto";
+import "Configuration.proto";
 
 package aapt.pb;
 

@@ -505,7 +505,7 @@ struct ResStringPool_span
 
     // The range of characters in the string that this span applies to.
     uint32_t firstChar, lastChar;
-};
+} __attribute__((__packed__, aligned(1)));
 
 /**
  * Convenience class for accessing data in a ResStringPool resource.
@@ -2214,7 +2214,7 @@ public:
     // resolve resources that do not exist in this ResTable.  If 'attrType' is
     // supplied, the value will be type checked for this format if 'attrID'
     // is not supplied or found.
-    bool stringToValue(Res_value* outValue, String16* outString,
+    bool stringToValue(const ssize_t FORCED_PACKAGE_ID, Res_value* outValue, String16* outString,
                        const char16_t* s, size_t len,
                        bool preserveSpaces, bool coerceType,
                        uint32_t attrID = 0,

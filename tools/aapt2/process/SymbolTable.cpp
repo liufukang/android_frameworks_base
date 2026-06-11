@@ -17,6 +17,7 @@
 #include "process/SymbolTable.h"
 
 #include <iostream>
+#include <set>
 
 #include "android-base/logging.h"
 #include "android-base/stringprintf.h"
@@ -119,6 +120,27 @@ const SymbolTable::Symbol* SymbolTable::FindByName(const ResourceName& name) {
   return shared_symbol.get();
 }
 
+const SymbolTable::Symbol* SymbolTable::FindByNameNoMangle(const ResourceName& name) {
+  // 直接用原始名称查找，跳过 mangling
+  if (const std::shared_ptr<Symbol>& s = cache_.get(name)) {
+    return s.get();
+  }
+
+  std::unique_ptr<Symbol> symbol = delegate_->FindByName(name, sources_);
+  if (symbol == nullptr) {
+    return nullptr;
+  }
+
+  std::shared_ptr<Symbol> shared_symbol(std::move(symbol));
+  cache_.put(name, shared_symbol);
+
+  if (shared_symbol->id) {
+    id_cache_.put(shared_symbol->id.value(), shared_symbol);
+  }
+
+  return shared_symbol.get();
+}
+
 const SymbolTable::Symbol* SymbolTable::FindById(const ResourceId& id) {
   if (const std::shared_ptr<Symbol>& s = id_cache_.get(id)) {
     return s.get();
@@ -213,6 +235,11 @@ std::unique_ptr<SymbolTable::Symbol> ResourceTableSymbolSource::FindByName(
       } else {
         return {};
       }
+    } else if (sr.entry->values.empty()) {
+      // 预填充的空 attr 条目（只有 pinned ID，无 Attribute 值）：
+      // 返回 nullptr 让 SymbolTable 回退到 AssetManagerSymbolSource 提供完整 Attribute 信息。
+      // entry 的 pinned ID 仍由 IdAssigner 在 ResourceTable 层面正确处理。
+      return {};
     }
   }
   return symbol;
@@ -237,6 +264,20 @@ std::map<size_t, std::string> AssetManagerSymbolSource::GetAssignedPackageIds() 
   });
 
   return package_map;
+}
+
+std::vector<std::string> AssetManagerSymbolSource::GetAllPackageNames() const {
+  // 收集所有 include 包的包名（包括 0x7F），用于 fallback 搜索。
+  // bundle 的 0x7F 资源会在 host 编译时被引用，后续由 RemapHostResourceIdsTask 重映射 ID
+  std::vector<std::string> names;
+  std::set<std::string> seen;
+  asset_manager_.ForEachPackage([&names, &seen](const std::string& name, uint8_t id) -> bool {
+    if (seen.insert(name).second) {
+      names.push_back(name);
+    }
+    return true;
+  });
+  return names;
 }
 
 bool AssetManagerSymbolSource::IsPackageDynamic(uint32_t packageId,
@@ -298,7 +339,11 @@ static std::unique_ptr<SymbolTable::Symbol> LookupAttributeInTable(
 
       auto name = am.GetResourceName(map_entry.key);
       if (!name.has_value()) {
-        return nullptr;
+        // 当 -I 包含双包 bundle（0x7F + target）时，0x7F 包中 attr 的 enum/flag symbol
+        // 可能引用 target 包中已被排除的 legacy entry（如 id/parent），
+        // 此时 GetResourceName 会失败。跳过此 symbol 而非中止整个 attr 解析，
+        // 因为 attr 的 type mask 已从 ATTR_TYPE 获取，缺失的 symbol 不影响编译
+        continue;
       }
 
       std::optional<ResourceName> parsed_name = ResourceUtils::ToResourceName(*name);
@@ -433,6 +478,37 @@ std::unique_ptr<SymbolTable::Symbol> AssetManagerSymbolSource::FindByReference(
     return FindByName(ref.name.value());
   }
   return {};
+}
+
+std::vector<std::pair<ResourceName, ResourceId>>
+AssetManagerSymbolSource::GetAll7fResources() const {
+  // 遍历所有 -I 加载的 include 包，收集 package_id == 0x7F 的全部资源
+  // 这些资源需要预填充到 host ResourceTable，让 IdAssigner 分配 host 体系 ID
+  constexpr uint8_t kAppPackageId = 0x7F;
+  std::vector<std::pair<ResourceName, ResourceId>> result;
+
+  for (const auto& assets : apk_assets_) {
+    for (const auto& loaded_package : assets->GetLoadedArsc()->GetPackages()) {
+      if (loaded_package->GetPackageId() != kAppPackageId) {
+        continue;
+      }
+      // 遍历该 0x7F 包的所有资源 ID
+      for (auto it = loaded_package->begin(); it != loaded_package->end(); ++it) {
+        uint32_t resid = *it;
+        if (resid == 0) continue;
+
+        // 通过 AssetManager2 获取资源名称
+        auto name = asset_manager_.GetResourceName(resid);
+        if (!name.has_value()) continue;
+
+        std::optional<ResourceName> parsed_name = ResourceUtils::ToResourceName(*name);
+        if (!parsed_name) continue;
+
+        result.emplace_back(std::move(*parsed_name), ResourceId(resid));
+      }
+    }
+  }
+  return result;
 }
 
 }  // namespace aapt

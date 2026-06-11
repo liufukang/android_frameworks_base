@@ -277,9 +277,51 @@ const SymbolTable::Symbol* ReferenceLinker::ResolveSymbol(const Reference& refer
           }
         }
       }
+      // 搜索所有 -I include 包（包括 0x7F）中的资源（跳过 callsite 自身的包）。
+      // bundle 的 0x7F 资源会被引用，后续由 RemapHostResourceIdsTask 重映射 ID
+      if (symbols->GetSearchAllIncludePackages()) {
+        const auto& pkg_names = symbols->GetIncludePackageNames();
+        for (const std::string& pkg : pkg_names) {
+          if (pkg == callsite.package) continue;
+          symbol = symbols->FindByNameNoMangle(ResourceName(pkg, name.type, name.entry));
+          if (symbol && symbol->id) {
+            // 记录 0x7F fallback 资源，用于生成 R 类字段
+            if (symbol->id.value().package_id() == kAppPackageId) {
+              symbols->RecordFallbackResolvedEntry(
+                  ResourceName(callsite.package, name.type, name.entry),
+                  symbol->id.value());
+            }
+            return symbol;
+          }
+        }
+      }
+
       return nullptr;
     }
-    return symbols->FindByName(name);
+    // 包名非空：先正常查找
+    const SymbolTable::Symbol* symbol = symbols->FindByName(name);
+    if (symbol) {
+      return symbol;
+    }
+    // 当包名等于编译包名但找不到时，回退搜索所有 -I include 包（包括 0x7F）中的资源
+    if (symbols->GetSearchAllIncludePackages() &&
+        name.package == context->GetCompilationPackage()) {
+      const auto& pkg_names = symbols->GetIncludePackageNames();
+      for (const std::string& pkg : pkg_names) {
+        if (pkg == name.package) continue;
+        symbol = symbols->FindByNameNoMangle(ResourceName(pkg, name.type, name.entry));
+        if (symbol && symbol->id) {
+          // 记录 0x7F fallback 资源，用于生成 R 类字段
+          if (symbol->id.value().package_id() == kAppPackageId) {
+            symbols->RecordFallbackResolvedEntry(
+                ResourceName(name.package, name.type, name.entry),
+                symbol->id.value());
+          }
+          return symbol;
+        }
+      }
+    }
+    return nullptr;
   } else if (reference.id) {
     return symbols->FindById(reference.id.value());
   } else {
@@ -299,8 +341,11 @@ const SymbolTable::Symbol* ReferenceLinker::ResolveSymbolCheckVisibility(const R
   }
 
   if (!IsSymbolVisible(*symbol, reference, callsite)) {
-    if (out_error) *out_error = "is private";
-    return nullptr;
+    // 通过 --disable-visibility-check 标志控制（默认 true，允许引用非 PUBLIC 资源）
+    if (!symbols->GetDisableVisibilityCheck()) {
+      if (out_error) *out_error = "is private";
+      return nullptr;
+    }
   }
   return symbol;
 }

@@ -78,6 +78,7 @@ struct LinkOptions {
   bool use_sparse_encoding = false;
   std::unordered_set<std::string> extensions_to_not_compress;
   std::optional<std::regex> regex_to_not_compress;
+  std::optional<std::string> extensions_to_not_compress_path;
   FeatureFlagValues feature_flag_values;
 
   // Static lib options.
@@ -115,6 +116,21 @@ struct LinkOptions {
 
   // Whether we should fail on definitions of a resource with conflicting visibility.
   bool strict_visibility = false;
+
+  // 非限定引用解析失败时，搜索所有 -I include 包（android 包除外）
+  bool search_all_include_packages = false;
+
+  // 禁用资源可见性检查，允许引用 -I 包中的非 PUBLIC 资源（默认 true）
+  bool disable_visibility_check = true;
+
+  // 全局 Type ID 映射："attr=1,drawable=2,string=10,..." 逗号分隔
+  std::optional<std::string> type_id_mapping;
+
+  // Entry ID slot 配置："0,1,2,3" 逗号分隔的 slot 索引
+  std::optional<std::string> entry_slot_config;
+
+  // Legacy public.xml 路径，用于 0x7F 双 PackageChunk 输出
+  std::optional<std::string> legacy_public_xml_path;
 };
 
 class LinkCommand : public Command {
@@ -291,6 +307,8 @@ class LinkCommand : public Command {
                     &options_.manifest_fixer_options.rename_overlay_category);
     AddOptionalFlagList("-0", "File suffix not to compress.",
         &options_.extensions_to_not_compress);
+    AddOptionalFlag("-e", "File containing list of extensions not to compress.",
+        &options_.extensions_to_not_compress_path);
     AddOptionalSwitch("--no-compress", "Do not compress any resources.",
         &options_.do_not_compress_anything);
     AddOptionalSwitch("--keep-raw-values", "Preserve raw attribute values in xml files.",
@@ -341,6 +359,26 @@ class LinkCommand : public Command {
                       "updatableSystem=\"false\" to the root manifest node, overwriting any\n"
                       "existing attribute. This is ignored if the manifest has a versionCode.",
                       &options_.manifest_fixer_options.non_updatable_system);
+    AddOptionalSwitch("--search-all-include-packages",
+                      "When resolving non-qualified resource references, search all -I\n"
+                      "include packages as fallback (excluding android framework).",
+                      &options_.search_all_include_packages);
+    AddOptionalSwitch("--disable-visibility-check",
+                      "Disable resource visibility check, allowing references to non-public\n"
+                      "resources in -I packages. Enabled by default.",
+                      &options_.disable_visibility_check);
+    AddOptionalFlag("--type-id-mapping",
+                    "Specify type ID assignments as comma-separated type=id pairs.\n"
+                    "Example: attr=1,drawable=2,string=10. All types must be listed.",
+                    &options_.type_id_mapping);
+    AddOptionalFlag("--entry-slot-config",
+                    "Specify entry ID slot allocation as comma-separated slot indices.\n"
+                    "Each slot holds 1024 entry IDs. Example: 0,2,3",
+                    &options_.entry_slot_config);
+    AddOptionalFlag("--legacy-public-xml",
+                    "Path to a legacy public.xml for 0x7F dual-package output.\n"
+                    "Resources declared here are output in a separate 0x7F PackageChunk.",
+                    &options_.legacy_public_xml_path, Command::kPath);
   }
 
   int Action(const std::vector<std::string>& args) override;

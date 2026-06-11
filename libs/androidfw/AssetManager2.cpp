@@ -1469,8 +1469,9 @@ base::expected<uint32_t, NullOrIOError> AssetManager2::GetResourceId(
     for (const ConfiguredPackage& package_impl : package_group.packages_) {
       const LoadedPackage* package = package_impl.loaded_package_;
       if (package_name != package->GetPackageName()) {
-        // All packages in the same group are expected to have the same package name.
-        break;
+        // 同一 PackageGroup 中可能存在不同包名的包（如多个 bundle 共享 0x7F），
+        // 跳过不匹配的包继续搜索下一个
+        continue;
       }
 
       base::expected<uint32_t, NullOrIOError> resid = package->FindEntryByName(type16, entry16);
@@ -1577,11 +1578,20 @@ std::unique_ptr<Theme> AssetManager2::NewTheme() {
 void AssetManager2::ForEachPackage(base::function_ref<bool(const std::string&, uint8_t)> func,
                                    package_property_t excluded_property_flags) const {
   for (const PackageGroup& package_group : package_groups_) {
-    const auto loaded_package = package_group.packages_.front().loaded_package_;
-    if ((loaded_package->GetPropertyFlags() & excluded_property_flags) == 0U
-        && !func(loaded_package->GetPackageName(),
-                 package_group.dynamic_ref_table->mAssignedPackageId)) {
-      return;
+    // 遍历同一 PackageGroup 中所有不同名称的包，
+    // 解决多个 bundle 共享同一 packageId 但使用不同包名的问题
+    std::set<std::string> seen_names;
+    for (const auto& config_package : package_group.packages_) {
+      const auto& loaded_package = config_package.loaded_package_;
+      if ((loaded_package->GetPropertyFlags() & excluded_property_flags) != 0U) {
+        continue;
+      }
+      const std::string& pkg_name = loaded_package->GetPackageName();
+      if (seen_names.insert(pkg_name).second) {
+        if (!func(pkg_name, package_group.dynamic_ref_table->mAssignedPackageId)) {
+          return;
+        }
+      }
     }
   }
 }

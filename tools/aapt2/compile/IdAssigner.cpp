@@ -16,6 +16,8 @@
 
 #include "compile/IdAssigner.h"
 
+#include <algorithm>
+#include <functional>
 #include <map>
 #include <unordered_map>
 
@@ -48,6 +50,11 @@ struct NextIdFinder {
   // Retrieves the next available identifier that has not been reserved.
   std::optional<Id> NextId();
 
+  // 设置 entry ID 合法性校验器（用于 entry slot 分区）
+  void SetIdValidator(std::function<bool(Id)> validator) {
+    id_validator_ = std::move(validator);
+  }
+
  private:
   // Attempts to set `next_id_` to the next available identifier that has not been reserved.
   // Returns whether there were any available identifiers.
@@ -57,11 +64,24 @@ struct NextIdFinder {
   bool next_id_called_ = false;
   bool exhausted_ = false;
   typename std::map<Id, Key>::iterator next_preassigned_id_;
+  // 可选的 ID 合法性校验器
+  std::function<bool(Id)> id_validator_;
 };
 
 struct TypeGroup {
   explicit TypeGroup(uint8_t package_id, uint8_t type_id)
       : package_id_(package_id), type_id_(type_id){};
+
+  // 设置 entry ID slot 校验器
+  void SetEntrySlots(const std::vector<int>* entry_slots) {
+    if (entry_slots && !entry_slots->empty()) {
+      constexpr int SLOT_SIZE = 1024;
+      next_entry_id_.SetIdValidator([entry_slots, SLOT_SIZE](uint16_t id) -> bool {
+        int slot = id / SLOT_SIZE;
+        return std::find(entry_slots->begin(), entry_slots->end(), slot) != entry_slots->end();
+      });
+    }
+  }
 
   // Attempts to reserve the resource id for the specified resource name.
   // If the id is already reserved by a different name, an error message is returned.
@@ -99,8 +119,11 @@ struct ResourceTypeKey {
 }
 
 struct IdAssignerContext {
-  IdAssignerContext(std::string package_name, uint8_t package_id)
-      : package_name_(std::move(package_name)), package_id_(package_id) {
+  IdAssignerContext(std::string package_name, uint8_t package_id,
+                    const std::map<std::string, uint8_t>* type_id_mapping = nullptr,
+                    const std::vector<int>* entry_slots = nullptr)
+      : package_name_(std::move(package_name)), package_id_(package_id),
+        type_id_mapping_(type_id_mapping), entry_slots_(entry_slots) {
   }
 
   // Attempts to reserve the resource id for the specified resource name.
@@ -119,19 +142,55 @@ struct IdAssignerContext {
   std::map<ResourceType, uint8_t> non_staged_type_ids_;
   NextIdFinder<uint8_t, ResourceTypeKey> type_id_finder_ =
       NextIdFinder<uint8_t, ResourceTypeKey>(1);
+  // 全局 Type ID 映射表
+  const std::map<std::string, uint8_t>* type_id_mapping_ = nullptr;
+  // Entry slot 配置
+  const std::vector<int>* entry_slots_ = nullptr;
+  // 非真实资源类型（styleable/macro）的占位 Type ID（从 0xFE 递减）
+  uint8_t phantom_type_id_ = 0xFE;
+
+  // 将 type 名称标准化（处理 ?N -> ^attr-private）
+  static std::string NormalizeTypeName(const std::string& name) {
+    if (name.size() > 1 && name[0] == '?') {
+      bool all_digits = true;
+      for (size_t i = 1; i < name.size(); i++) {
+        if (!std::isdigit(name[i])) { all_digits = false; break; }
+      }
+      if (all_digits) return "^attr-private";
+    }
+    return name;
+  }
 };
 
 }  // namespace
 
 bool IdAssigner::Consume(IAaptContext* context, ResourceTable* table) {
-  IdAssignerContext assigned_ids(context->GetCompilationPackage(), context->GetPackageId());
+  IdAssignerContext assigned_ids(context->GetCompilationPackage(), context->GetPackageId(),
+                                 type_id_mapping_, entry_slots_);
+  // 为 legacy entry 创建无 slot 约束的分配器
+  IdAssignerContext legacy_assigned_ids(context->GetCompilationPackage(), context->GetPackageId(),
+                                         type_id_mapping_, nullptr);
   for (auto& package : table->packages) {
     for (auto& type : package->types) {
       for (auto& entry : type->entries) {
         const ResourceName name(package->name, type->named_type, entry->name);
-        if (entry->id && !assigned_ids.ReserveId(name, entry->id.value(), entry->visibility,
-                                                 context->GetDiagnostics())) {
-          return false;
+        // 判断当前 entry 是否为 legacy entry
+        bool is_legacy_entry = false;
+        if (entry->id && legacy_entry_names_ && !legacy_entry_names_->empty()) {
+          std::string type_name(type->named_type.to_string());
+          is_legacy_entry = legacy_entry_names_->count({type_name, std::string(entry->name)}) > 0;
+        }
+        if (entry->id && !is_legacy_entry) {
+          // non-legacy entry 在有 slot 约束的分配器中预留
+          if (!assigned_ids.ReserveId(name, entry->id.value(), entry->visibility,
+                                                   context->GetDiagnostics())) {
+            return false;
+          }
+        }
+        if (entry->id) {
+          // 所有 entry 都在 legacy 分配器中预留（避免 ID 冲突）
+          legacy_assigned_ids.ReserveId(name, entry->id.value(), entry->visibility,
+                                        context->GetDiagnostics());
         }
 
         auto v = entry->visibility;
@@ -179,7 +238,15 @@ bool IdAssigner::Consume(IAaptContext* context, ResourceTable* table) {
         if (entry->id) {
           continue;
         }
-        auto id = assigned_ids.NextId(name, context->GetDiagnostics());
+        // legacy entry 不受 entry-slot-config 约束，使用无 slot 限制的分配器
+        bool is_legacy = false;
+        if (legacy_entry_names_ && !legacy_entry_names_->empty()) {
+          std::string type_name(name.type.to_string());
+          is_legacy = legacy_entry_names_->count({type_name, std::string(entry->name)}) > 0;
+        }
+        auto id = is_legacy
+            ? legacy_assigned_ids.NextId(name, context->GetDiagnostics())
+            : assigned_ids.NextId(name, context->GetDiagnostics());
         if (!id.has_value()) {
           return false;
         }
@@ -222,22 +289,33 @@ std::optional<Id> NextIdFinder<Id, Key>::SkipToNextAvailableId() {
   if (exhausted_) {
     return {};
   }
-  while (next_preassigned_id_ != pre_assigned_ids_.end()) {
-    if (next_preassigned_id_->first == next_id_) {
+  while (true) {
+    // 跳过已预留的 ID
+    while (next_preassigned_id_ != pre_assigned_ids_.end()) {
+      if (next_preassigned_id_->first == next_id_) {
+        if (next_id_ == std::numeric_limits<Id>::max()) {
+          exhausted_ = true;
+          return {};
+        }
+        ++next_id_;
+        ++next_preassigned_id_;
+        continue;
+      }
+      CHECK(next_preassigned_id_->first > next_id_) << "Preassigned IDs are not in sorted order";
+      break;
+    }
+    // 跳过不满足 slot 校验的 ID
+    if (id_validator_ && !id_validator_(next_id_)) {
       if (next_id_ == std::numeric_limits<Id>::max()) {
-        // The last identifier was reserved so there are no more available identifiers.
         exhausted_ = true;
         return {};
       }
       ++next_id_;
-      ++next_preassigned_id_;
       continue;
     }
-    CHECK(next_preassigned_id_->first > next_id_) << "Preassigned IDs are not in sorted order";
     break;
   }
   if (next_id_ == std::numeric_limits<Id>::max()) {
-    // There are no more identifiers after this one, but this one is still available so return it.
     exhausted_ = true;
   }
   return next_id_++;
@@ -304,6 +382,8 @@ bool IdAssignerContext::ReserveId(const ResourceName& name, ResourceId id,
       return false;
     }
     type = types_.emplace(key, TypeGroup(package_id_, id.type_id())).first;
+    // 为新创建的 TypeGroup 设置 entry slot 校验
+    type->second.SetEntrySlots(entry_slots_);
   }
 
   if (!visibility.staged_api) {
@@ -350,15 +430,45 @@ std::optional<ResourceId> IdAssignerContext::NextId(const ResourceName& name,
   // Find the type id for non-staged resources of this type.
   auto non_staged_type = non_staged_type_ids_.find(name.type.type);
   if (non_staged_type == non_staged_type_ids_.end()) {
-    auto next_type_id = type_id_finder_.NextId();
-    CHECK(next_type_id.has_value()) << "resource type IDs allocated have exceeded maximum (256)";
-    non_staged_type = non_staged_type_ids_.emplace(name.type.type, *next_type_id).first;
+    uint8_t assigned_type_id;
+    if (type_id_mapping_) {
+      // 使用全局 Type ID 映射表查找
+      std::string lookup_name = NormalizeTypeName(std::string(name.type.to_string()));
+      auto it = type_id_mapping_->find(lookup_name);
+      if (it == type_id_mapping_->end()) {
+        // styleable/macro 等非真实资源类型不会被 flatten 到 arsc 中
+        // 分配占位 type ID（从 0xFE 递减，避免与映射表中的 ID 冲突）
+        if (name.type.type == ResourceType::kStyleable ||
+            name.type.type == ResourceType::kMacro) {
+          assigned_type_id = phantom_type_id_--;
+        } else {
+          diag->Error(android::DiagMessage()
+              << "resource type '" << name.type
+              << "' is not in --type-id-mapping. Add it to the mapping to proceed.");
+          return {};
+        }
+      } else {
+        assigned_type_id = it->second;
+      }
+      // 预留此 ID 防止冲突
+      {
+        ResourceTypeKey key{name.type.type, assigned_type_id};
+        type_id_finder_.ReserveId(key, assigned_type_id);
+      }
+    } else {
+      auto next_type_id = type_id_finder_.NextId();
+      CHECK(next_type_id.has_value()) << "resource type IDs allocated have exceeded maximum (256)";
+      assigned_type_id = *next_type_id;
+    }
+    non_staged_type = non_staged_type_ids_.emplace(name.type.type, assigned_type_id).first;
   }
 
   ResourceTypeKey key{name.type.type, non_staged_type->second};
   auto type = types_.find(key);
   if (type == types_.end()) {
     type = types_.emplace(key, TypeGroup(package_id_, key.id)).first;
+    // 为新创建的 TypeGroup 设置 entry slot 校验
+    type->second.SetEntrySlots(entry_slots_);
   }
 
   auto assign_result = type->second.NextId();
