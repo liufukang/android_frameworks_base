@@ -57,6 +57,8 @@ class VersionCommand : public Command {
   int Action(const std::vector<std::string>& /* args */) override {
     std::cerr << StringPrintf("%s %s", util::GetToolName(), util::GetToolFingerprint().c_str())
               << std::endl;
+    std::cerr << "  [+] add --search-all-include-packages flag support" << std::endl;
+    std::cerr << "  [+] add --disable-visibility-check flag (default: true)" << std::endl;
     return 0;
   }
 };

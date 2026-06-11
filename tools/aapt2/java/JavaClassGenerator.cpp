@@ -393,6 +393,12 @@ bool JavaClassGenerator::ProcessStyleable(const ResourceNameRef& name, const Res
   for (size_t i = 0; i < attr_count; i++) {
     const StyleableAttr& styleable_attr = sorted_attributes[i];
     if (SkipSymbol(styleable_attr.symbol)) {
+      // 即使跳过 Java class 生成，也必须输出 R.txt 的 child 行，
+      // 保证 R.txt 中 styleable 数组元素数量和 child 行数量一致
+      if (r_txt_printer != nullptr) {
+        r_txt_printer->Println(
+            StringPrintf("int styleable %s %zd", sorted_attributes[i].field_name.c_str(), i));
+      }
       continue;
     }
 
