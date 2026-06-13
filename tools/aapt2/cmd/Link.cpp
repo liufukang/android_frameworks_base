@@ -2051,10 +2051,39 @@ class Linker {
     // 将 legacy 0x7F 资源条目传递给 TableFlattener
     if (!legacy_entries_.empty()) {
       options_.table_flattener_options.legacy_entries = legacy_entries_;
-      options_.table_flattener_options.legacy_package_name = context_->GetCompilationPackage();
+      // 0x7F legacy 包的 package name 与主包一致：
+      // 优先使用 --arsc-package-name，否则使用 compilation package
+      options_.table_flattener_options.legacy_package_name =
+          options_.arsc_package_name.value_or(context_->GetCompilationPackage());
+    }
+
+    // --arsc-package-name：仅覆盖 arsc 中 PackageChunk 的 package name，
+    // 不影响 manifest、R 类生成和资源引用解析。
+    // 在 FlattenTable 前临时修改，flatten 后改回（与 feature split 重写模式一致）。
+    std::string original_package_name;
+    ResourceTablePackage* arsc_name_rewrite_pkg = nullptr;
+    if (options_.arsc_package_name) {
+      for (auto& pkg : table->packages) {
+        if (pkg->name == context_->GetCompilationPackage()) {
+          arsc_name_rewrite_pkg = pkg.get();
+          original_package_name = pkg->name;
+          pkg->name = options_.arsc_package_name.value();
+          if (context_->IsVerbose()) {
+            context_->GetDiagnostics()->Note(
+                android::DiagMessage() << "overriding arsc package name to '"
+                                       << options_.arsc_package_name.value() << "'");
+          }
+          break;
+        }
+      }
     }
 
     bool success = FlattenTable(table, options_.output_format, writer);
+
+    // 恢复 package name
+    if (arsc_name_rewrite_pkg != nullptr) {
+      arsc_name_rewrite_pkg->name = original_package_name;
+    }
 
     if (package_to_rewrite != nullptr) {
       // Change the name back.

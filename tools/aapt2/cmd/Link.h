@@ -131,6 +131,9 @@ struct LinkOptions {
 
   // Legacy public.xml 路径，用于 0x7F 双 PackageChunk 输出
   std::optional<std::string> legacy_public_xml_path;
+
+  // arsc 中 PackageChunk 的 package name 覆盖值（不影响 manifest 和 R 类）
+  std::optional<std::string> arsc_package_name;
 };
 
 class LinkCommand : public Command {
@@ -379,6 +382,10 @@ class LinkCommand : public Command {
                     "Path to a legacy public.xml for 0x7F dual-package output.\n"
                     "Resources declared here are output in a separate 0x7F PackageChunk.",
                     &options_.legacy_public_xml_path, Command::kPath);
+    AddOptionalFlag("--arsc-package-name",
+                    "Override the package name written to PackageChunk in resources.arsc.\n"
+                    "Does not affect AndroidManifest.xml or R class generation.",
+                    &options_.arsc_package_name);
   }
 
   int Action(const std::vector<std::string>& args) override;
