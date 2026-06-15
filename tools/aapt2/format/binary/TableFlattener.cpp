@@ -454,6 +454,12 @@ class PackageFlattener {
       expected_type_id++;
       type_pool_.MakeRef(type.named_type.to_string());
 
+      // entries 为空时（如 legacy 过滤后），只写入 type name 到 pool 和空 TypeSpec
+      if (type.entries.empty()) {
+        FlattenTypeSpec(type, type.entries, buffer);
+        continue;
+      }
+
       const auto type_spec_header = FlattenTypeSpec(type, type.entries, buffer);
       if (!type_spec_header) {
         return false;
@@ -649,11 +655,8 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
                   return legacy_names.count({type_name, std::string(e.name)}) > 0;
                 }),
             entries.end());
-        if (entries.empty()) {
-          it = package.types.erase(it);
-        } else {
-          ++it;
-        }
+        // 即使 entries 为空也保留 type，确保 Type StringPool 包含正确的 type name
+        ++it;
       }
     }
   }
