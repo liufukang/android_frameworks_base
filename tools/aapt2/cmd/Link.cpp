@@ -822,6 +822,20 @@ class Linker {
           << "--entry-slot-config: slots=" << options_.entry_slot_config.value());
     }
 
+    // 解析 --entry-slot-size
+    if (options_.entry_slot_size_str) {
+      auto maybe_size = ResourceUtils::ParseInt(options_.entry_slot_size_str.value());
+      if (!maybe_size || (int)maybe_size.value() <= 0) {
+        context_->GetDiagnostics()->Error(android::DiagMessage()
+            << "invalid value '" << options_.entry_slot_size_str.value()
+            << "' for --entry-slot-size, must be a positive integer");
+        return false;
+      }
+      options_.entry_slot_size = (int)maybe_size.value();
+      context_->GetDiagnostics()->Note(android::DiagMessage()
+          << "--entry-slot-size: " << options_.entry_slot_size);
+    }
+
     // 解析 --legacy-public-xml
     if (options_.legacy_public_xml_path) {
       const std::string& path = options_.legacy_public_xml_path.value();
@@ -1043,8 +1057,6 @@ class Linker {
     // 设置可见性检查开关（默认 true 表示禁用检查，允许引用非 PUBLIC 资源）
     context_->GetExternalSymbols()->SetDisableVisibilityCheck(options_.disable_visibility_check);
 
-    // 保存裸指针用于在 IdAssigner 前预填充 0x7F 资源
-    asset_source_ptr_ = asset_source.get();
     context_->GetExternalSymbols()->AppendSource(std::move(asset_source));
     return true;
   }
@@ -2028,7 +2040,8 @@ class Linker {
           context_->GetPackageId() != kAppPackageId &&
           context_->GetPackageId() != kFrameworkPackageId)
         || (!options_.allow_reserved_package_id && context_->GetPackageId() > kAppPackageId);
-    if (isSplitPackage && included_feature_base_ == context_->GetCompilationPackage()) {
+    if (isSplitPackage && !options_.arsc_package_name &&
+        included_feature_base_ == context_->GetCompilationPackage()) {
       // The base APK is included, and this is a feature split. If the base package is
       // the same as this package, then we are building an old style Android Instant Apps feature
       // split and must apply this workaround to avoid requiring namespaces support.
@@ -2288,7 +2301,8 @@ class Linker {
           &options_.stable_id_map,
           type_id_mapping_table_.empty() ? nullptr : &type_id_mapping_table_,
           entry_slots_.empty() ? nullptr : &entry_slots_,
-          nullptr);  // 无 legacy_entry_names，因为 legacy entry 已从 table 中移除
+          nullptr,  // 无 legacy_entry_names，因为 legacy entry 已从 table 中移除
+          options_.entry_slot_size);
       if (!id_assigner.Consume(context_, &final_table_)) {
         context_->GetDiagnostics()->Error(android::DiagMessage() << "failed assigning IDs");
         return 1;
@@ -2645,9 +2659,6 @@ class Linker {
 
   // The package name of the base application, if it is included.
   std::optional<std::string> included_feature_base_;
-
-  // 保存 AssetManagerSymbolSource 指针，用于在 IdAssigner 前预填充 0x7F 资源
-  AssetManagerSymbolSource* asset_source_ptr_ = nullptr;
 
   // 解析后的全局 Type ID 映射表
   std::map<std::string, uint8_t> type_id_mapping_table_;

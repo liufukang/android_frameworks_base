@@ -120,8 +120,8 @@ struct LinkOptions {
   // 非限定引用解析失败时，搜索所有 -I include 包（android 包除外）
   bool search_all_include_packages = false;
 
-  // 禁用资源可见性检查，允许引用 -I 包中的非 PUBLIC 资源（默认 true）
-  bool disable_visibility_check = true;
+  // 禁用资源可见性检查，允许引用 -I 包中的非 PUBLIC 资源（默认 false，需显式开启）
+  bool disable_visibility_check = false;
 
   // 全局 Type ID 映射："attr=1,drawable=2,string=10,..." 逗号分隔
   std::optional<std::string> type_id_mapping;
@@ -129,8 +129,14 @@ struct LinkOptions {
   // Entry ID slot 配置："0,1,2,3" 逗号分隔的 slot 索引
   std::optional<std::string> entry_slot_config;
 
+  // Entry slot 容量（每个 slot 包含的 entry ID 数量），默认 1024
+  int entry_slot_size = 1024;
+
   // Legacy public.xml 路径，用于 0x7F 双 PackageChunk 输出
   std::optional<std::string> legacy_public_xml_path;
+
+  // --entry-slot-size 的原始字符串（用于命令行解析）
+  std::optional<std::string> entry_slot_size_str;
 
   // arsc 中 PackageChunk 的 package name 覆盖值（不影响 manifest 和 R 类）
   std::optional<std::string> arsc_package_name;
@@ -376,8 +382,11 @@ class LinkCommand : public Command {
                     &options_.type_id_mapping);
     AddOptionalFlag("--entry-slot-config",
                     "Specify entry ID slot allocation as comma-separated slot indices.\n"
-                    "Each slot holds 1024 entry IDs. Example: 0,2,3",
+                    "Slot capacity is controlled by --entry-slot-size. Example: 0,2,3",
                     &options_.entry_slot_config);
+    AddOptionalFlag("--entry-slot-size",
+                    "Number of entry IDs per slot (default 1024). Example: 512",
+                    &options_.entry_slot_size_str);
     AddOptionalFlag("--legacy-public-xml",
                     "Path to a legacy public.xml for 0x7F dual-package output.\n"
                     "Resources declared here are output in a separate 0x7F PackageChunk.",

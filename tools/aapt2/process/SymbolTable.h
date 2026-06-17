@@ -130,15 +130,6 @@ class SymbolTable {
     return disable_visibility_check_;
   }
 
-  // 记录通过 fallback 解析到的 0x7F 资源（用于后续添加到 ResourceTable 生成 R 类字段）
-  void RecordFallbackResolvedEntry(const ResourceName& name, ResourceId id) {
-    fallback_resolved_entries_.emplace_back(name, id);
-  }
-
-  const std::vector<std::pair<ResourceName, ResourceId>>& GetFallbackResolvedEntries() const {
-    return fallback_resolved_entries_;
-  }
-
  private:
   NameMangler* mangler_;
   std::unique_ptr<ISymbolTableDelegate> delegate_;
@@ -153,11 +144,8 @@ class SymbolTable {
   bool search_all_include_packages_ = false;
   std::vector<std::string> include_package_names_;
 
-  // 禁用资源可见性检查（默认 true，允许引用 -I 包中的非 PUBLIC 资源）
-  bool disable_visibility_check_ = true;
-
-  // fallback 解析到的 0x7F 资源列表
-  std::vector<std::pair<ResourceName, ResourceId>> fallback_resolved_entries_;
+  // 禁用资源可见性检查（默认 false，需通过 --disable-visibility-check 显式开启）
+  bool disable_visibility_check_ = false;
 
   DISALLOW_COPY_AND_ASSIGN(SymbolTable);
 };

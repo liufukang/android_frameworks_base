@@ -285,12 +285,6 @@ const SymbolTable::Symbol* ReferenceLinker::ResolveSymbol(const Reference& refer
           if (pkg == callsite.package) continue;
           symbol = symbols->FindByNameNoMangle(ResourceName(pkg, name.type, name.entry));
           if (symbol && symbol->id) {
-            // 记录 0x7F fallback 资源，用于生成 R 类字段
-            if (symbol->id.value().package_id() == kAppPackageId) {
-              symbols->RecordFallbackResolvedEntry(
-                  ResourceName(callsite.package, name.type, name.entry),
-                  symbol->id.value());
-            }
             return symbol;
           }
         }
@@ -311,12 +305,6 @@ const SymbolTable::Symbol* ReferenceLinker::ResolveSymbol(const Reference& refer
         if (pkg == name.package) continue;
         symbol = symbols->FindByNameNoMangle(ResourceName(pkg, name.type, name.entry));
         if (symbol && symbol->id) {
-          // 记录 0x7F fallback 资源，用于生成 R 类字段
-          if (symbol->id.value().package_id() == kAppPackageId) {
-            symbols->RecordFallbackResolvedEntry(
-                ResourceName(name.package, name.type, name.entry),
-                symbol->id.value());
-          }
           return symbol;
         }
       }

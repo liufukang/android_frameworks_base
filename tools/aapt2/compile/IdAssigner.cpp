@@ -73,11 +73,10 @@ struct TypeGroup {
       : package_id_(package_id), type_id_(type_id){};
 
   // 设置 entry ID slot 校验器
-  void SetEntrySlots(const std::vector<int>* entry_slots) {
+  void SetEntrySlots(const std::vector<int>* entry_slots, int slot_size) {
     if (entry_slots && !entry_slots->empty()) {
-      constexpr int SLOT_SIZE = 1024;
-      next_entry_id_.SetIdValidator([entry_slots, SLOT_SIZE](uint16_t id) -> bool {
-        int slot = id / SLOT_SIZE;
+      next_entry_id_.SetIdValidator([entry_slots, slot_size](uint16_t id) -> bool {
+        int slot = id / slot_size;
         return std::find(entry_slots->begin(), entry_slots->end(), slot) != entry_slots->end();
       });
     }
@@ -121,9 +120,11 @@ struct ResourceTypeKey {
 struct IdAssignerContext {
   IdAssignerContext(std::string package_name, uint8_t package_id,
                     const std::map<std::string, uint8_t>* type_id_mapping = nullptr,
-                    const std::vector<int>* entry_slots = nullptr)
+                    const std::vector<int>* entry_slots = nullptr,
+                    int entry_slot_size = 1024)
       : package_name_(std::move(package_name)), package_id_(package_id),
-        type_id_mapping_(type_id_mapping), entry_slots_(entry_slots) {
+        type_id_mapping_(type_id_mapping), entry_slots_(entry_slots),
+        entry_slot_size_(entry_slot_size) {
   }
 
   // Attempts to reserve the resource id for the specified resource name.
@@ -146,6 +147,8 @@ struct IdAssignerContext {
   const std::map<std::string, uint8_t>* type_id_mapping_ = nullptr;
   // Entry slot 配置
   const std::vector<int>* entry_slots_ = nullptr;
+  // Entry slot 容量
+  int entry_slot_size_ = 1024;
   // 非真实资源类型（styleable/macro）的占位 Type ID（从 0xFE 递减）
   uint8_t phantom_type_id_ = 0xFE;
 
@@ -166,7 +169,7 @@ struct IdAssignerContext {
 
 bool IdAssigner::Consume(IAaptContext* context, ResourceTable* table) {
   IdAssignerContext assigned_ids(context->GetCompilationPackage(), context->GetPackageId(),
-                                 type_id_mapping_, entry_slots_);
+                                 type_id_mapping_, entry_slots_, entry_slot_size_);
   // 为 legacy entry 创建无 slot 约束的分配器
   IdAssignerContext legacy_assigned_ids(context->GetCompilationPackage(), context->GetPackageId(),
                                          type_id_mapping_, nullptr);
@@ -383,7 +386,7 @@ bool IdAssignerContext::ReserveId(const ResourceName& name, ResourceId id,
     }
     type = types_.emplace(key, TypeGroup(package_id_, id.type_id())).first;
     // 为新创建的 TypeGroup 设置 entry slot 校验
-    type->second.SetEntrySlots(entry_slots_);
+    type->second.SetEntrySlots(entry_slots_, entry_slot_size_);
   }
 
   if (!visibility.staged_api) {
@@ -468,7 +471,7 @@ std::optional<ResourceId> IdAssignerContext::NextId(const ResourceName& name,
   if (type == types_.end()) {
     type = types_.emplace(key, TypeGroup(package_id_, key.id)).first;
     // 为新创建的 TypeGroup 设置 entry slot 校验
-    type->second.SetEntrySlots(entry_slots_);
+    type->second.SetEntrySlots(entry_slots_, entry_slot_size_);
   }
 
   auto assign_result = type->second.NextId();
