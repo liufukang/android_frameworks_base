@@ -353,7 +353,8 @@ void InsertEntryIntoTableView(ResourceTableView& table, const ResourceTablePacka
                               const std::optional<AllowNew>& allow_new,
                               const std::optional<OverlayableItem>& overlayable_item,
                               const std::optional<StagedId>& staged_id,
-                              const std::vector<std::unique_ptr<ResourceConfigValue>>& values) {
+                              const std::vector<std::unique_ptr<ResourceConfigValue>>& values,
+                              bool is_shadow = false) {
   SortedVectorInserter<ResourceTablePackageView, PackageViewComparer> package_inserter;
   SortedVectorInserter<ResourceTableTypeView, TypeViewComparer> type_inserter;
   SortedVectorInserter<ResourceTableEntryView, EntryViewComparer> entry_inserter;
@@ -376,7 +377,8 @@ void InsertEntryIntoTableView(ResourceTableView& table, const ResourceTablePacka
                                    .visibility = visibility,
                                    .allow_new = allow_new,
                                    .overlayable_item = overlayable_item,
-                                   .staged_id = staged_id};
+                                   .staged_id = staged_id,
+                                   .is_shadow = is_shadow};
   for (auto& value : values) {
     new_entry.values.emplace_back(value.get());
   }
@@ -405,13 +407,13 @@ ResourceTableView ResourceTable::GetPartitionedView(const ResourceTableViewOptio
       for (const auto& entry : type->entries) {
         InsertEntryIntoTableView(view, package.get(), type.get(), entry->name, entry->id,
                                  entry->visibility, entry->allow_new, entry->overlayable_item,
-                                 entry->staged_id, entry->values);
+                                 entry->staged_id, entry->values, entry->is_shadow);
 
         if (options.create_alias_entries && entry->staged_id) {
           auto alias_id = entry->staged_id.value().id;
           InsertEntryIntoTableView(view, package.get(), type.get(), entry->name, alias_id,
                                    entry->visibility, entry->allow_new, entry->overlayable_item, {},
-                                   entry->values);
+                                   entry->values, entry->is_shadow);
         }
       }
     }

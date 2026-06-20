@@ -125,6 +125,10 @@ class ResourceEntry {
   // Whether this resource is public (and must maintain the same entry ID across builds).
   Visibility visibility;
 
+  // 标记此 entry 为 shadow（仅供 IDE 索引，不进入 arsc 输出）。
+  // shadow entry 的引用解析会跳过本地查找直接使用 -I 中的真实 ID。
+  bool is_shadow = false;
+
   std::optional<AllowNew> allow_new;
 
   // The declarations of this resource as overlayable for RROs
@@ -215,6 +219,8 @@ struct ResourceTableEntryView {
   std::optional<OverlayableItem> overlayable_item;
   std::optional<StagedId> staged_id;
   std::vector<const ResourceConfigValue*> values;
+  // shadow 标记：透传自 ResourceEntry::is_shadow，TableFlattener 据此跳过 arsc 输出
+  bool is_shadow = false;
 
   const ResourceConfigValue* FindValue(const android::ConfigDescription& config,
                                        android::StringPiece product = {}) const;

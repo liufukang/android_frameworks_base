@@ -218,6 +218,7 @@ std::unique_ptr<SymbolTable::Symbol> ResourceTableSymbolSource::FindByName(
 
   std::unique_ptr<SymbolTable::Symbol> symbol = util::make_unique<SymbolTable::Symbol>();
   symbol->is_public = (sr.entry->visibility.level == Visibility::Level::kPublic);
+  symbol->is_shadow = sr.entry->is_shadow;
 
   if (sr.entry->id) {
     symbol->id = sr.entry->id.value();
@@ -484,6 +485,12 @@ std::vector<std::pair<ResourceName, ResourceId>>
 AssetManagerSymbolSource::GetAll7fResources() const {
   // 遍历所有 -I 加载的 include 包，收集 package_id == 0x7F 的全部资源
   // 这些资源需要预填充到 host ResourceTable，让 IdAssigner 分配 host 体系 ID
+  //
+  // 关键：直接走 LoadedArsc → LoadedPackage → TypeSpec → key string pool 路径，
+  // **不要**经 AssetManager2::GetResourceName。因为 AssetManager2 的解析受 PackageGroup
+  // 路由约束：当多个 .bundle 都使用 0x7F 时，AssetManager2 的 0x7F PackageGroup 只会
+  // 路由到第一个加载的 0x7F 包，后续 0x7F 资源会因可见性/路由问题查不到名字（覆盖率
+  // 实测仅约 2162/N），而 LoadedArsc 直接读 chunk 数据可拿到全部名字。
   constexpr uint8_t kAppPackageId = 0x7F;
   std::vector<std::pair<ResourceName, ResourceId>> result;
 
@@ -492,20 +499,100 @@ AssetManagerSymbolSource::GetAll7fResources() const {
       if (loaded_package->GetPackageId() != kAppPackageId) {
         continue;
       }
-      // 遍历该 0x7F 包的所有资源 ID
-      for (auto it = loaded_package->begin(); it != loaded_package->end(); ++it) {
-        uint32_t resid = *it;
-        if (resid == 0) continue;
 
-        // 通过 AssetManager2 获取资源名称
-        auto name = asset_manager_.GetResourceName(resid);
-        if (!name.has_value()) continue;
+      const android::ResStringPool* type_pool = loaded_package->GetTypeStringPool();
+      const android::ResStringPool* key_pool = loaded_package->GetKeyStringPool();
+      if (type_pool == nullptr || key_pool == nullptr) continue;
 
-        std::optional<ResourceName> parsed_name = ResourceUtils::ToResourceName(*name);
-        if (!parsed_name) continue;
+      // 通过 ForEachTypeSpec 遍历所有 type，按 (type, entry_index) 输出真实存在的 entry。
+      // type_id 是 1-based 内部索引（已减去 type_id_offset_），需要从 ResTable_type chunk
+      // 的 header.id 字段读出 effective type id（含 offset）才能拼出正确 ResourceId。
+      loaded_package->ForEachTypeSpec(
+          [&](const android::TypeSpec& type_spec, uint8_t internal_type_id) {
+            auto type_name_str16_result = type_pool->stringAt(
+                static_cast<size_t>(internal_type_id - 1));
+            if (!type_name_str16_result.ok()) return;
+            std::string type_name = android::util::Utf16ToUtf8(*type_name_str16_result);
 
-        result.emplace_back(std::move(*parsed_name), ResourceId(resid));
-      }
+            // 跳过 attr-private（aapt2 内部类型，运行时不使用）
+            if (type_name == "^attr-private") return;
+
+            uint16_t entry_count = dtohs(type_spec.type_spec->entryCount);
+            if (entry_count == 0) return;
+
+            // effective type id 从 type_entries[0] 的 ResTable_type header.id 取
+            uint8_t effective_type_id = 0;
+            if (!type_spec.type_entries.empty() && type_spec.type_entries[0].type) {
+              effective_type_id = type_spec.type_entries[0].type->id;
+            }
+            if (effective_type_id == 0) return;
+
+            // 收集每个 entry：扫所有 type_entries（不同 config 的 ResTable_type chunks），
+            // 取并集（任一 config 中存在 entry 就视为存在）
+            std::vector<bool> entry_present(entry_count, false);
+            std::vector<uint32_t> entry_key_indices(entry_count, 0xFFFFFFFFu);
+            for (const auto& te : type_spec.type_entries) {
+              const auto& tchunk = te.type;
+              if (!tchunk) continue;
+              uint32_t this_entry_count = dtohl(tchunk->entryCount);
+              uint32_t entries_start = dtohl(tchunk->entriesStart);
+              const uint8_t flags = tchunk->flags;
+              const uint8_t* chunk_base =
+                  reinterpret_cast<const uint8_t*>(tchunk.unsafe_ptr());
+              for (uint32_t i = 0;
+                   i < this_entry_count && i < entry_count;
+                   ++i) {
+                // entry offset 表：32-bit 或 16-bit（FLAG_OFFSET16）
+                uint32_t offset;
+                if (flags & android::ResTable_type::FLAG_OFFSET16) {
+                  const uint16_t* off16 = reinterpret_cast<const uint16_t*>(
+                      chunk_base + dtohs(tchunk->header.headerSize));
+                  uint16_t off = dtohs(off16[i]);
+                  offset = (off == 0xFFFFu) ? 0xFFFFFFFFu : (off * 4u);
+                } else {
+                  const uint32_t* off32 = reinterpret_cast<const uint32_t*>(
+                      chunk_base + dtohs(tchunk->header.headerSize));
+                  offset = dtohl(off32[i]);
+                }
+                if (offset == 0xFFFFFFFFu) continue;
+                // 从 entries_start + offset 取 ResTable_entry，读 key 字段
+                // ResTable_entry 是 union（Full/Compact），key() 方法自动处理两种格式
+                const uint8_t* entry_ptr = chunk_base + entries_start + offset;
+                const auto* entry =
+                    reinterpret_cast<const android::ResTable_entry*>(entry_ptr);
+                uint32_t key_index = entry->key();
+                entry_present[i] = true;
+                if (entry_key_indices[i] == 0xFFFFFFFFu) {
+                  entry_key_indices[i] = key_index;
+                }
+              }
+            }
+
+            // 输出
+            for (uint32_t i = 0; i < entry_count; ++i) {
+              if (!entry_present[i]) continue;
+              uint32_t key_index = entry_key_indices[i];
+              if (key_index == 0xFFFFFFFFu) continue;
+              auto entry_name_str16_result = key_pool->stringAt(key_index);
+              if (!entry_name_str16_result.ok()) continue;
+              std::string entry_name = android::util::Utf16ToUtf8(*entry_name_str16_result);
+              if (entry_name.empty()) continue;
+
+              // ParseResourceType 返回 const ResourceType*；某些 type 名（如 ^attr-private）
+              // 不被识别，跳过。前面已经过滤过 ^attr-private，但这里再保护一层。
+              const ResourceType* parsed_type = ParseResourceType(type_name);
+              if (parsed_type == nullptr) continue;
+
+              ResourceName name(loaded_package->GetPackageName(),
+                                *parsed_type,
+                                entry_name);
+              uint32_t resid =
+                  (uint32_t(kAppPackageId) << 24) |
+                  (uint32_t(effective_type_id) << 16) |
+                  uint32_t(i);
+              result.emplace_back(std::move(name), ResourceId(resid));
+            }
+          });
     }
   }
   return result;

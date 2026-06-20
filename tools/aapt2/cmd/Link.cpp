@@ -20,8 +20,10 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <fstream>
 #include <queue>
 #include <set>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -1057,6 +1059,41 @@ class Linker {
     // 设置可见性检查开关（默认 true 表示禁用检查，允许引用非 PUBLIC 资源）
     context_->GetExternalSymbols()->SetDisableVisibilityCheck(options_.disable_visibility_check);
 
+    // 自动 legacy 推导（替代 --legacy-public-xml）：
+    // 当编译目标是 0x7F 包（portal 宿主）时，扫描所有 -I 输入中 packageId == 0x7F 的资源，
+    // 将其加入 legacy_entries_ 走双 PackageChunk 输出流程。
+    // 这样 portal 不再需要 CollectLegacyPublicXmlTask 来生成 legacy_public.xml。
+    //
+    // 触发条件：当前包 packageId == 0x7F。
+    // - portal 宿主默认 packageId 0x7F，触发
+    // - bundle（packageId != 0x7F，如 0x50/0x52）不触发
+    if (context_->GetPackageId() == kAppPackageId) {
+      auto entries_7f = asset_source->GetAll7fResources();
+      size_t added = 0;
+      // 用 (type, name) 去重，避免重复添加（同一资源可能在多个 -I 中出现，
+      // 也可能与显式的 --legacy-public-xml 重叠）
+      std::set<std::pair<std::string, std::string>> seen;
+      for (const auto& le : legacy_entries_) {
+        seen.emplace(le.type_name, le.entry_name);
+      }
+      for (const auto& [name, id] : entries_7f) {
+        std::string type_name = name.type.to_string();
+        if (!seen.emplace(type_name, name.entry).second) continue;
+        TableFlattenerOptions::LegacyPublicEntry entry;
+        entry.type_name = type_name;
+        entry.entry_name = name.entry;
+        entry.type_id = (id.id >> 16) & 0xFF;
+        entry.entry_id = id.id & 0xFFFF;
+        legacy_entries_.push_back(std::move(entry));
+        ++added;
+      }
+      if (added > 0) {
+        context_->GetDiagnostics()->Note(android::DiagMessage()
+            << "auto-legacy-from-include: " << added
+            << " 0x7F entries derived from -I (packageId=0x7F)");
+      }
+    }
+
     context_->GetExternalSymbols()->AppendSource(std::move(asset_source));
     return true;
   }
@@ -1985,6 +2022,7 @@ class Linker {
   bool WriteApk(IArchiveWriter* writer, proguard::KeepSet* keep_set, xml::XmlResource* manifest,
                 ResourceTable* table) {
     TRACE_CALL();
+
     const bool keep_raw_values = (context_->GetPackageType() == PackageType::kStaticLib)
                                  || options_.keep_raw_values;
     bool result = FlattenXml(context_, *manifest, kAndroidManifestPath, keep_raw_values,
@@ -2296,7 +2334,106 @@ class Linker {
             << " legacy entries before IdAssigner");
       }
 
+      // 仅 Portal 宿主（packageId==0x7F）需要预留 legacy entry ID 位置，
+      // 避免宿主资源被分配到与 legacy 条目冲突的 entry_id。
+      // Bundle 模块（packageId!=0x7F）不需要：它们输出独立的 legacy PackageChunk，
+      // 与自身 target package 不存在 entry_id 冲突。
+      if (context_->GetPackageId() == kAppPackageId) {
+        for (const auto& le : legacy_entries_) {
+          auto parsed_type = ParseResourceNamedType(le.type_name);
+          if (!parsed_type) continue;
+          ResourceName legacy_name(context_->GetCompilationPackage(),
+                                   ResourceNamedType(parsed_type->name, parsed_type->type),
+                                   le.entry_name);
+          ResourceId legacy_id(kAppPackageId, le.type_id, le.entry_id);
+          options_.stable_id_map.emplace(std::move(legacy_name), legacy_id);
+        }
+      }
+
       // IdAssigner 只分配 non-legacy entry 的 ID，不产生碰撞
+      // 注意：shadow 标记必须在 IdAssigner 之前完成，IdAssigner 才能跳过 shadow entry
+      // 不为它们分配 entry ID（避免占用 entry-slot-config 槽位）。
+      // 收集 shadow_set：union 自 --shadow-resources（type/name 文本）和 --public（public.aar 中的 R.txt）
+      std::set<std::pair<std::string, std::string>> shadow_set;
+      if (options_.shadow_resources_path) {
+        const std::string& path = options_.shadow_resources_path.value();
+        std::ifstream shadow_file(path);
+        if (!shadow_file.is_open()) {
+          context_->GetDiagnostics()->Error(android::DiagMessage()
+              << "failed to open --shadow-resources file: " << path);
+          return 1;
+        }
+        std::string line;
+        while (std::getline(shadow_file, line)) {
+          if (line.empty() || line[0] == '#') continue;
+          auto slash = line.find('/');
+          if (slash == std::string::npos) continue;
+          shadow_set.emplace(line.substr(0, slash), line.substr(slash + 1));
+        }
+      }
+      // --public：直接传 public.aar，aapt2 解压读 R.txt 自动提取 (type, name)
+      // R.txt 格式：每行 "int <type> <name> <hex_id>"（normal）或
+      // "int[] styleable <name> { ... }"（styleable 整体），后者跳过
+      for (const std::string& aar_path : options_.public_aar_paths) {
+        std::string err;
+        auto aar = io::ZipFileCollection::Create(aar_path, &err);
+        if (!aar) {
+          context_->GetDiagnostics()->Error(android::DiagMessage()
+              << "failed to open --public AAR " << aar_path << ": " << err);
+          return 1;
+        }
+        io::IFile* r_txt_file = aar->FindFile("R.txt");
+        if (!r_txt_file) {
+          context_->GetDiagnostics()->Warn(android::DiagMessage()
+              << "--public AAR " << aar_path << " does not contain R.txt, skipping");
+          continue;
+        }
+        auto r_txt_data = r_txt_file->OpenAsData();
+        if (!r_txt_data) {
+          context_->GetDiagnostics()->Error(android::DiagMessage()
+              << "failed to read R.txt from --public AAR " << aar_path);
+          return 1;
+        }
+        std::string r_txt_content(static_cast<const char*>(r_txt_data->data()),
+                                  r_txt_data->size());
+        std::istringstream r_txt_stream(r_txt_content);
+        std::string line;
+        size_t aar_count = 0;
+        while (std::getline(r_txt_stream, line)) {
+          if (line.empty()) continue;
+          // 跳过 styleable 数组与子索引（不是 ResourceTable 中的真实 entry）
+          if (line.compare(0, 4, "int ") != 0) continue;
+          // "int <type> <name> 0x..."
+          std::istringstream ls(line);
+          std::string kind, type, name;
+          ls >> kind >> type >> name;
+          if (type.empty() || name.empty()) continue;
+          if (type == "styleable") continue;  // 不是 entry，跳过
+          shadow_set.emplace(type, name);
+          ++aar_count;
+        }
+        context_->GetDiagnostics()->Note(android::DiagMessage()
+            << "--public: " << aar_count << " entries from " << aar_path);
+      }
+      // 应用 shadow_set 到 ResourceTable：标记当前包中匹配的 entry 为 shadow
+      if (!shadow_set.empty()) {
+        size_t marked_count = 0;
+        for (auto& package : final_table_.packages) {
+          if (package->name != context_->GetCompilationPackage()) continue;
+          for (auto& type : package->types) {
+            const std::string type_name = type->named_type.to_string();
+            for (auto& entry : type->entries) {
+              if (shadow_set.count(std::make_pair(type_name, entry->name))) {
+                entry->is_shadow = true;
+                ++marked_count;
+              }
+            }
+          }
+        }
+        context_->GetDiagnostics()->Note(android::DiagMessage()
+            << "shadow resources: " << marked_count << " entries marked");
+      }
+
       IdAssigner id_assigner(
           &options_.stable_id_map,
           type_id_mapping_table_.empty() ? nullptr : &type_id_mapping_table_,
@@ -2350,6 +2487,41 @@ class Linker {
         }
         context_->GetDiagnostics()->Note(android::DiagMessage()
             << "restored " << restored << " legacy entries with declared IDs");
+      }
+
+      // 为仍未在 final_table_ 中出现的 legacy entries 合成占位条目。
+      // 当宿主未生成 stub 资源时，legacy entries 不会出现在 table 中，
+      // ReferenceLinker 将无法解析对它们的引用（如 @style/Theme.AppCompat.Light）。
+      // 合成空 entry（无 values，设 ID 和 public visibility）使 ReferenceLinker 能找到它们。
+      // 对于 attr 类型，SymbolTable 检测到空 entry 后回退到 AssetManagerSymbolSource
+      // （由 -I 传入的 bundle 提供完整 Attribute 格式信息）。
+      if (!legacy_entries_.empty()) {
+        auto* host_package = final_table_.FindOrCreatePackage(
+            context_->GetCompilationPackage());
+        size_t synthesized = 0;
+        for (const auto& le : legacy_entries_) {
+          auto parsed_type = ParseResourceNamedType(le.type_name);
+          if (!parsed_type) {
+            continue;
+          }
+          auto* type = host_package->FindOrCreateType(parsed_type.value());
+          ResourceEntry* existing = type->FindEntry(le.entry_name);
+          if (existing != nullptr) {
+            // 已存在（由 stub 或恢复流程创建），跳过
+            continue;
+          }
+          // 合成空占位 entry（visibility 保持 kUndefined 以避免
+          // ReferenceLinker 的 "no definition for declared symbol" 完整性检查。
+          // --disable-visibility-check 默认 true，确保引用仍可解析。）
+          ResourceEntry* entry = type->FindOrCreateEntry(le.entry_name);
+          entry->id = ResourceId(kAppPackageId, le.type_id, le.entry_id);
+          synthesized++;
+        }
+        if (synthesized > 0) {
+          context_->GetDiagnostics()->Note(android::DiagMessage()
+              << "synthesized " << synthesized
+              << " phantom legacy entries for ReferenceLinker");
+        }
       }
 
       // Now grab each ID and emit it as a file.

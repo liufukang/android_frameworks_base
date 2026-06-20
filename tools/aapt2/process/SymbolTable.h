@@ -70,6 +70,9 @@ class SymbolTable {
     std::shared_ptr<Attribute> attribute;
     bool is_public = false;
     bool is_dynamic = false;
+    // shadow 标记：本地 ResourceTable 中的 shadow entry 透传，告知 ReferenceLinker
+    // 跳过本地查找，走 search-all-include-packages 路径解析为 -I 中的真实 ID。
+    bool is_shadow = false;
   };
 
   explicit SymbolTable(NameMangler* mangler);

@@ -241,6 +241,16 @@ bool IdAssigner::Consume(IAaptContext* context, ResourceTable* table) {
         if (entry->id) {
           continue;
         }
+        // shadow entry：分配 ID 但走无 slot 约束的分配器（避免占用 entry-slot-config 槽位）
+        // 这些 ID 仅在 ResourceTable 内部存在，TableFlattener 会跳过 shadow entry 不写入 arsc。
+        if (entry->is_shadow) {
+          auto id = legacy_assigned_ids.NextId(name, context->GetDiagnostics());
+          if (!id.has_value()) {
+            return false;
+          }
+          entry->id = id.value();
+          continue;
+        }
         // legacy entry 不受 entry-slot-config 约束，使用无 slot 限制的分配器
         bool is_legacy = false;
         if (legacy_entry_names_ && !legacy_entry_names_->empty()) {

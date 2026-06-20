@@ -410,6 +410,10 @@ class PackageFlattener {
     uint32_t* config_masks = type_spec_writer.NextBlock<uint32_t>(num_entries);
 
     for (const ResourceTableEntryView& entry : sorted_entries) {
+      // shadow entry 不写入 type_spec config_masks（不占 spec 槽位）
+      if (entry.is_shadow) {
+        continue;
+      }
       const uint16_t entry_id = entry.id.value();
 
       // Populate the config masks for this entry.
@@ -477,6 +481,11 @@ class PackageFlattener {
       std::map<ConfigDescription, std::vector<FlatEntry>> config_to_entry_list_map;
 
       for (const ResourceTableEntryView& entry : type.entries) {
+        // shadow entry：仅供 IDE 索引，不写入 arsc。
+        // 跳过该 entry 不占用 entry ID（保持其他 entry 的 ID 不变，依赖 entry.id 已分配）。
+        if (entry.is_shadow) {
+          continue;
+        }
         if (entry.staged_id) {
           aliases_.insert(std::make_pair(
               entry.staged_id.value().id.id,
@@ -606,12 +615,13 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
   ChunkWriter table_writer(buffer_);
   ResTable_header* table_header = table_writer.StartChunk<ResTable_header>(RES_TABLE_TYPE);
 
-  // 计算 packageCount：GetPartitionedView 会将 legacy entry（id=0x7F...）
-  // 分配到一个独立的 0x7F PackageView。我们跳过这个 view（用 FlattenLegacyPackage
-  // 手动构建），但 packageCount 仍然等于 table_view.packages.size()，
-  // 因为 0x7F PackageView 被跳过后由手动构建的 legacy 包替代（数量不变）。
-  // 如果没有 legacy entries，则 table_view 中不会有 0x7F PackageView，也不需要额外 +1。
+  // 计算 packageCount：table_view.packages 包含所有 PackageView（含宿主 0x7F），
+  // 如果有 legacy entries，FlattenLegacyPackage 会额外输出一个 0x7F legacy PackageChunk，
+  // 因此总 packageCount = table_view.packages.size() + 1。
   uint32_t total_packages = table_view.packages.size();
+  if (!options_.legacy_entries.empty()) {
+    total_packages += 1;  // FlattenLegacyPackage 额外输出的 legacy PackageChunk
+  }
   table_header->packageCount = android::util::HostToDevice32(total_packages);
 
   // Flatten the values string pool.
@@ -627,25 +637,20 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
     }
   }
 
-  // 从 target 包中排除 legacy entry：
+  // 从所有包中排除 legacy entry：
   // Link.cpp 在 IdAssigner 前移除了 legacy entry（避免 ID 碰撞），之后恢复了 legacy entry
   // 并设置了 legacy 声明的 ID（供 ReferenceLinker 解析引用）。
   // GetPartitionedView 按 entry->id 的 package_id 分配到不同 PackageView：
   //   - legacy entry（id=0x7F...）→ 0x7F PackageView
   //   - non-legacy entry（id=0x50...）→ 0x50 PackageView
-  // target 包（0x50）不应包含 legacy entry（它们只存在于 0x7F 包），
-  // 此处从非 0x7F 的 PackageView 中过滤掉 legacy entry（如有残留）。
-  // 0x7F PackageView 本身会被整体跳过（FlattenLegacyPackage 已手动构建）。
+  // 但 Portal 宿主本身也是 0x7F，所以宿主自身 entries 和 legacy entries 在同一 PackageView。
+  // 此处从所有 PackageView 中过滤掉 legacy entries，保留宿主自身资源。
   if (!options_.legacy_entries.empty()) {
     std::set<std::pair<std::string, std::string>> legacy_names;
     for (const auto& le : options_.legacy_entries) {
       legacy_names.insert({le.type_name, le.entry_name});
     }
     for (auto& package : table_view.packages) {
-      // 跳过 0x7F PackageView——其中的 entry 由 FlattenLegacyPackage 处理
-      if (package.id.has_value() && package.id.value() == kAppPackageId) {
-        continue;
-      }
       for (auto it = package.types.begin(); it != package.types.end(); ) {
         std::string type_name = it->named_type.to_string();
         auto& entries = it->entries;
@@ -661,13 +666,8 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
     }
   }
 
-  // Flatten each package (target 包，legacy entries 已排除; 跳过 0x7F 包).
+  // Flatten each package (legacy entries 已从各 PackageView 中过滤).
   for (auto& package : table_view.packages) {
-    // 跳过 0x7F PackageView——已通过 FlattenLegacyPackage 手动构建
-    if (!options_.legacy_entries.empty() && package.id.has_value() &&
-        package.id.value() == kAppPackageId) {
-      continue;
-    }
     if (context->GetPackageType() == PackageType::kApp) {
       // Write a self mapping entry for this package if the ID is non-standard (0x7f).
       CHECK((bool)package.id) << "Resource ids have not been assigned before flattening the table";
@@ -781,18 +781,18 @@ bool TableFlattener::FlattenLegacyPackage(IAaptContext* context, ResourceTable* 
     // 添加 entries
     for (const auto* le : type_info.entries) {
       auto src_it = src_entry_index.find({le->type_name, le->entry_name});
-      if (src_it == src_entry_index.end()) {
-        context->GetDiagnostics()->Warn(android::DiagMessage()
-            << "legacy entry " << le->type_name << "/" << le->entry_name
-            << " not found in source package, skipping");
-        continue;
-      }
-      // 复制 entry view，使用 legacy 的 entry_id，标记为 public
+      // 复制 entry view，使用 legacy 的 entry_id，标记为 public。
+      // 若源包中找不到 entry 值（Portal 宿主场景：legacy 资源定义在 bundle 中，
+      // 宿主自身 ResourceTable 无此资源），输出空 entry（values 为空），
+      // PackageFlattener 会将其写为 NO_ENTRY（offset=-1），
+      // Portal 合并阶段在空位注入 bundle 真实数据。
       ResourceTableEntryView ev;
-      ev.name = src_it->second->name;
+      ev.name = le->entry_name;
       ev.id = le->entry_id;
       ev.visibility.level = Visibility::Level::kPublic;
-      ev.values = src_it->second->values;
+      if (src_it != src_entry_index.end()) {
+        ev.values = src_it->second->values;
+      }
       type_view.entries.push_back(std::move(ev));
     }
   }

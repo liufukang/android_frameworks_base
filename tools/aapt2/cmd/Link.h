@@ -140,6 +140,18 @@ struct LinkOptions {
 
   // arsc 中 PackageChunk 的 package name 覆盖值（不影响 manifest 和 R 类）
   std::optional<std::string> arsc_package_name;
+
+  // Shadow resources 文件路径：每行 "type/name"，列出仅供 IDE 索引的 stub 资源。
+  // 这些资源在 mergeRes 阶段进入 ResourceTable 让 IDE 识别，但：
+  //  - 编译 layout XML 引用时跳过本地查找，走 -I 真实 ID
+  //  - arsc 输出时跳过这些 entry，不进入 .bundle
+  std::optional<std::string> shadow_resources_path;
+
+  // Public AAR 文件路径列表：每个为 bundleDeps 暴露的 public.aar（含 R.txt）。
+  // 与 --shadow-resources 等价，但语义更直接：直接传 public.aar，aapt2 内部解压
+  // 读 R.txt，提取 (type, name) 列表自动加入 shadow_set。
+  // 是 --shadow-resources 的高层替代，配合上游 BundlePlugin 改造直接使用 public.aar。
+  std::vector<std::string> public_aar_paths;
 };
 
 class LinkCommand : public Command {
@@ -395,6 +407,19 @@ class LinkCommand : public Command {
                     "Override the package name written to PackageChunk in resources.arsc.\n"
                     "Does not affect AndroidManifest.xml or R class generation.",
                     &options_.arsc_package_name);
+    AddOptionalFlag("--shadow-resources",
+                    "Path to a shadow resources file (one 'type/name' per line).\n"
+                    "These resources are loaded into ResourceTable for IDE indexing but:\n"
+                    "  - layout XML references resolve to -I real IDs (search-all-include-packages)\n"
+                    "  - skipped from arsc output (do not increase .bundle size)\n"
+                    "Used together with -I and --search-all-include-packages.",
+                    &options_.shadow_resources_path, Command::kPath);
+    AddOptionalFlagList("--public",
+                    "Path to a public.aar file (bundleDeps exported API).\n"
+                    "aapt2 reads R.txt inside the AAR and extracts (type, name) automatically\n"
+                    "as shadow resources (equivalent to --shadow-resources but takes AAR directly).\n"
+                    "Can be specified multiple times for multiple bundleDeps.",
+                    &options_.public_aar_paths, Command::kPath);
   }
 
   int Action(const std::vector<std::string>& args) override;

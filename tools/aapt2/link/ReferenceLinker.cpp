@@ -259,7 +259,9 @@ const SymbolTable::Symbol* ReferenceLinker::ResolveSymbol(const Reference& refer
       // Use the callsite's package name if no package name was defined.
       const SymbolTable::Symbol* symbol = symbols->FindByName(
           ResourceName(callsite.package, name.type, name.entry));
-      if (symbol) {
+      // shadow 标记的本地 symbol 仅用于 IDE 索引与 mergeRes 流程，不参与编译时引用解析。
+      // 跳过本地 shadow，强制走 search_all_include_packages 路径解析为 -I 中的真实 ID。
+      if (symbol && !symbol->is_shadow) {
         return symbol;
       }
 
