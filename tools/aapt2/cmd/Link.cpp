@@ -57,6 +57,7 @@
 #include "io/Util.h"
 #include "io/ZipArchive.h"
 #include "java/JavaClassGenerator.h"
+#include "text/Printer.h"
 #include "java/ManifestClassGenerator.h"
 #include "java/ProguardRules.h"
 #include "link/FeatureFlagsFilter.h"
@@ -1437,6 +1438,84 @@ class Linker {
       return false;
     }
 
+    // 追加 --public AAR 中 R.txt 的内容到宿主 R.txt：
+    // 让 AGP 后续 R.jar 生成步骤包含上游 public 资源字段，
+    // 替代 Gradle 端 stub res 注入路径。
+    //
+    // 仅在 fout_text 存在（即生成 R.txt）且当前在生成"主包"R 类时追加，
+    // 避免在 generate_text_symbols 之外的场景或非主包遍历时重复追加。
+    if (fout_text != nullptr &&
+        !merged_public_rtxt_content_.empty() &&
+        package_name_to_generate == context_->GetCompilationPackage()) {
+      // 收集已写入的 (type, name) 集合用于去重——上游 R.txt 与当前 ResourceTable
+      // 可能含同名 entry（来自 stub res 注入）。同名时保留宿主已有，跳过上游。
+      std::set<std::pair<std::string, std::string>> seen;
+      for (const auto& package : table->packages) {
+        if (package->name != context_->GetCompilationPackage()) continue;
+        for (const auto& type : package->types) {
+          std::string type_name = type->named_type.to_string();
+          for (const auto& entry : type->entries) {
+            seen.emplace(type_name, entry->name);
+          }
+        }
+      }
+
+      // 用 text::Printer 写入 fout_text，保持与 JavaClassGenerator 相同的写入路径
+      text::Printer rtxt_printer(fout_text.get());
+
+      // 解析合并的 R.txt 内容，按行去重写入
+      std::istringstream input(merged_public_rtxt_content_);
+      std::string line;
+      // styleable 上下文：当前 styleable 的 name 是否已被去重决定
+      bool skip_styleable_context = false;
+      size_t appended = 0;
+      while (std::getline(input, line)) {
+        if (line.empty()) continue;
+        // R.txt 行类型：
+        //   "int <type> <name> 0x..."         普通条目
+        //   "int[] styleable <name> { ... }"  styleable 数组（顶层）
+        //   "int styleable <name>_<attr> N"   styleable 子索引
+        bool skip_this = false;
+        if (line.compare(0, 4, "int ") == 0) {
+          std::istringstream ls(line);
+          std::string kind, type, name;
+          ls >> kind >> type >> name;
+          if (type.empty() || name.empty()) {
+            skip_this = true;
+          } else if (type == "styleable") {
+            // 子索引依附于上一条 int[] styleable 数组，是否跳过取决于上下文
+            if (skip_styleable_context) skip_this = true;
+          } else {
+            // 普通条目去重
+            if (seen.count(std::make_pair(type, name)) > 0) {
+              skip_this = true;
+            } else {
+              seen.emplace(type, name);
+            }
+          }
+        } else if (line.compare(0, 6, "int[] ") == 0) {
+          // 顶层 styleable 数组：解析 name，去重整组
+          std::istringstream ls(line);
+          std::string kind, type, name;
+          ls >> kind >> type >> name;
+          if (type == "styleable" && !name.empty()) {
+            skip_styleable_context =
+                seen.count(std::make_pair(std::string("styleable"), name)) > 0;
+            if (skip_styleable_context) {
+              skip_this = true;
+            } else {
+              seen.emplace(std::string("styleable"), name);
+            }
+          }
+        }
+        if (skip_this) continue;
+        rtxt_printer.Println(line);
+        ++appended;
+      }
+      context_->GetDiagnostics()->Note(android::DiagMessage()
+          << "merged " << appended << " R.txt lines from --public AAR(s) into host R.txt");
+    }
+
     return true;
   }
 
@@ -2396,6 +2475,18 @@ class Linker {
         }
         std::string r_txt_content(static_cast<const char*>(r_txt_data->data()),
                                   r_txt_data->size());
+
+        // 保存原始 R.txt 内容，在 R.txt 输出阶段追加到宿主 R.txt。
+        // 包含所有行类型（int / int[] styleable / styleable 子索引），让 AGP 后续
+        // R.jar 生成步骤直接看到上游 public 资源字段，无需 Gradle 端 stub res 注入。
+        if (!r_txt_content.empty()) {
+          if (!merged_public_rtxt_content_.empty() &&
+              merged_public_rtxt_content_.back() != '\n') {
+            merged_public_rtxt_content_ += '\n';
+          }
+          merged_public_rtxt_content_ += r_txt_content;
+        }
+
         std::istringstream r_txt_stream(r_txt_content);
         std::string line;
         size_t aar_count = 0;
@@ -2838,6 +2929,10 @@ class Linker {
   std::vector<int> entry_slots_;
   // 解析后的 legacy 0x7F 资源条目
   std::vector<TableFlattenerOptions::LegacyPublicEntry> legacy_entries_;
+  // 通过 --public 传入的所有 AAR 中 R.txt 的原始内容（按 AAR 顺序拼接，含 styleable 行）。
+  // 在 R.txt 输出阶段追加到宿主 R.txt，让 AGP 后续 R.jar 生成步骤包含上游 public 资源字段，
+  // 替代 Gradle 端 stub res 注入路径。
+  std::string merged_public_rtxt_content_;
 };
 
 int LinkCommand::Action(const std::vector<std::string>& args) {
