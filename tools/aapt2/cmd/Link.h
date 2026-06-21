@@ -120,9 +120,6 @@ struct LinkOptions {
   // 非限定引用解析失败时，搜索所有 -I include 包（android 包除外）
   bool search_all_include_packages = false;
 
-  // 禁用资源可见性检查，允许引用 -I 包中的非 PUBLIC 资源（默认 false，需显式开启）
-  bool disable_visibility_check = false;
-
   // 全局 Type ID 映射："attr=1,drawable=2,string=10,..." 逗号分隔
   std::optional<std::string> type_id_mapping;
 
@@ -141,16 +138,9 @@ struct LinkOptions {
   // arsc 中 PackageChunk 的 package name 覆盖值（不影响 manifest 和 R 类）
   std::optional<std::string> arsc_package_name;
 
-  // Shadow resources 文件路径：每行 "type/name"，列出仅供 IDE 索引的 stub 资源。
-  // 这些资源在 mergeRes 阶段进入 ResourceTable 让 IDE 识别，但：
-  //  - 编译 layout XML 引用时跳过本地查找，走 -I 真实 ID
-  //  - arsc 输出时跳过这些 entry，不进入 .bundle
-  std::optional<std::string> shadow_resources_path;
-
-  // Public AAR 文件路径列表：每个为 bundleDeps 暴露的 public.aar（含 R.txt）。
-  // 与 --shadow-resources 等价，但语义更直接：直接传 public.aar，aapt2 内部解压
-  // 读 R.txt，提取 (type, name) 列表自动加入 shadow_set。
-  // 是 --shadow-resources 的高层替代，配合上游 BundlePlugin 改造直接使用 public.aar。
+  // Public AAR 文件路径列表：bundleDeps 暴露的 public.aar（含 R.txt）。
+  // aapt2 解压读 R.txt，提取 (type, name) 作为 shadow resources，
+  // 并将 R.txt 内容合并到宿主 R.txt 输出。
   std::vector<std::string> public_aar_paths;
 };
 
@@ -384,10 +374,6 @@ class LinkCommand : public Command {
                       "When resolving non-qualified resource references, search all -I\n"
                       "include packages as fallback (excluding android framework).",
                       &options_.search_all_include_packages);
-    AddOptionalSwitch("--disable-visibility-check",
-                      "Disable resource visibility check, allowing references to non-public\n"
-                      "resources in -I packages. Enabled by default.",
-                      &options_.disable_visibility_check);
     AddOptionalFlag("--type-id-mapping",
                     "Specify type ID assignments as comma-separated type=id pairs.\n"
                     "Example: attr=1,drawable=2,string=10. All types must be listed.",
@@ -407,17 +393,10 @@ class LinkCommand : public Command {
                     "Override the package name written to PackageChunk in resources.arsc.\n"
                     "Does not affect AndroidManifest.xml or R class generation.",
                     &options_.arsc_package_name);
-    AddOptionalFlag("--shadow-resources",
-                    "Path to a shadow resources file (one 'type/name' per line).\n"
-                    "These resources are loaded into ResourceTable for IDE indexing but:\n"
-                    "  - layout XML references resolve to -I real IDs (search-all-include-packages)\n"
-                    "  - skipped from arsc output (do not increase .bundle size)\n"
-                    "Used together with -I and --search-all-include-packages.",
-                    &options_.shadow_resources_path, Command::kPath);
     AddOptionalFlagList("--public",
                     "Path to a public.aar file (bundleDeps exported API).\n"
-                    "aapt2 reads R.txt inside the AAR and extracts (type, name) automatically\n"
-                    "as shadow resources (equivalent to --shadow-resources but takes AAR directly).\n"
+                    "aapt2 reads R.txt inside the AAR and extracts (type, name) as shadow\n"
+                    "resources, and merges R.txt content into host R.txt output.\n"
                     "Can be specified multiple times for multiple bundleDeps.",
                     &options_.public_aar_paths, Command::kPath);
   }

@@ -331,11 +331,8 @@ const SymbolTable::Symbol* ReferenceLinker::ResolveSymbolCheckVisibility(const R
   }
 
   if (!IsSymbolVisible(*symbol, reference, callsite)) {
-    // 通过 --disable-visibility-check 标志控制（默认 true，允许引用非 PUBLIC 资源）
-    if (!symbols->GetDisableVisibilityCheck()) {
-      if (out_error) *out_error = "is private";
-      return nullptr;
-    }
+    if (out_error) *out_error = "is private";
+    return nullptr;
   }
   return symbol;
 }

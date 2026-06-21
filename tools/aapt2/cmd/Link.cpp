@@ -23,11 +23,16 @@
 #include <fstream>
 #include <queue>
 #include <set>
-#include <sstream>
 #include <unordered_map>
 #include <vector>
 
 #include "AppInfo.h"
+#include "aura/ArscPackageNameRewriter.h"
+#include "aura/LegacyPackageCollector.h"
+#include "aura/PhantomEntrySynthesizer.h"
+#include "aura/PublicAarReader.h"
+#include "aura/PublicRtxtMerger.h"
+#include "aura/ShadowResourceMarker.h"
 #include "Debug.h"
 #include "LoadedApk.h"
 #include "NameMangler.h"
@@ -57,7 +62,6 @@
 #include "io/Util.h"
 #include "io/ZipArchive.h"
 #include "java/JavaClassGenerator.h"
-#include "text/Printer.h"
 #include "java/ManifestClassGenerator.h"
 #include "java/ProguardRules.h"
 #include "link/FeatureFlagsFilter.h"
@@ -841,55 +845,11 @@ class Linker {
 
     // 解析 --legacy-public-xml
     if (options_.legacy_public_xml_path) {
-      const std::string& path = options_.legacy_public_xml_path.value();
-      auto xml = LoadXml(path, context_->GetDiagnostics());
-      if (!xml) {
-        context_->GetDiagnostics()->Error(android::DiagMessage()
-            << "failed to parse --legacy-public-xml: " << path);
+      if (!aura::LegacyPackageCollector::ParseLegacyPublicXml(
+              options_.legacy_public_xml_path.value(), context_->GetDiagnostics(),
+              &legacy_entries_)) {
         return false;
       }
-      xml::Element* root_el = xml::FindRootElement(xml->root.get());
-      if (!root_el || root_el->name != "resources") {
-        context_->GetDiagnostics()->Error(android::DiagMessage()
-            << "--legacy-public-xml root element must be <resources>, got: "
-            << (root_el ? root_el->name : "(null)"));
-        return false;
-      }
-      for (const xml::Element* child_el : root_el->GetChildElements()) {
-        if (child_el->name != "public") continue;
-        const xml::Attribute* type_attr = child_el->FindAttribute({}, "type");
-        const xml::Attribute* name_attr = child_el->FindAttribute({}, "name");
-        const xml::Attribute* id_attr = child_el->FindAttribute({}, "id");
-        if (!type_attr || !name_attr || !id_attr) {
-          context_->GetDiagnostics()->Error(android::DiagMessage(android::Source(path).WithLine(child_el->line_number))
-              << "<public> element requires type, name, and id attributes");
-          return false;
-        }
-        auto maybe_id = ResourceUtils::ParseInt(id_attr->value);
-        if (!maybe_id) {
-          context_->GetDiagnostics()->Error(android::DiagMessage(android::Source(path).WithLine(child_el->line_number))
-              << "invalid resource ID: " << id_attr->value);
-          return false;
-        }
-        uint32_t full_id = static_cast<uint32_t>(maybe_id.value());
-        uint8_t pkg_id = (full_id >> 24) & 0xFF;
-        if (pkg_id != 0x7F) {
-          context_->GetDiagnostics()->Error(android::DiagMessage(android::Source(path).WithLine(child_el->line_number))
-              << "legacy public entry must have package ID 0x7F, got: "
-              << StringPrintf("0x%02x", pkg_id));
-          return false;
-        }
-        uint8_t type_id= (full_id >> 16) & 0xFF;
-        uint16_t entry_id = full_id & 0xFFFF;
-        TableFlattenerOptions::LegacyPublicEntry entry;
-        entry.type_name = type_attr->value;
-        entry.entry_name = name_attr->value;
-        entry.type_id = type_id;
-        entry.entry_id = entry_id;
-        legacy_entries_.push_back(std::move(entry));
-      }
-      context_->GetDiagnostics()->Note(android::DiagMessage()
-          << "--legacy-public-xml: " << legacy_entries_.size() << " entries loaded from " << path);
     }
 
     return true;
@@ -1057,42 +1017,11 @@ class Linker {
       context_->GetExternalSymbols()->SetIncludePackageNames(std::move(include_pkg_names));
     }
 
-    // 设置可见性检查开关（默认 true 表示禁用检查，允许引用非 PUBLIC 资源）
-    context_->GetExternalSymbols()->SetDisableVisibilityCheck(options_.disable_visibility_check);
-
-    // 自动 legacy 推导（替代 --legacy-public-xml）：
-    // 当编译目标是 0x7F 包（portal 宿主）时，扫描所有 -I 输入中 packageId == 0x7F 的资源，
-    // 将其加入 legacy_entries_ 走双 PackageChunk 输出流程。
-    // 这样 portal 不再需要 CollectLegacyPublicXmlTask 来生成 legacy_public.xml。
-    //
-    // 触发条件：当前包 packageId == 0x7F。
-    // - portal 宿主默认 packageId 0x7F，触发
-    // - bundle（packageId != 0x7F，如 0x50/0x52）不触发
+    // 自动 legacy 推导：当 packageId==0x7F（Portal 宿主）时，
+    // 扫描 -I 中所有 0x7F entries 加入 legacy_entries_
     if (context_->GetPackageId() == kAppPackageId) {
-      auto entries_7f = asset_source->GetAll7fResources();
-      size_t added = 0;
-      // 用 (type, name) 去重，避免重复添加（同一资源可能在多个 -I 中出现，
-      // 也可能与显式的 --legacy-public-xml 重叠）
-      std::set<std::pair<std::string, std::string>> seen;
-      for (const auto& le : legacy_entries_) {
-        seen.emplace(le.type_name, le.entry_name);
-      }
-      for (const auto& [name, id] : entries_7f) {
-        std::string type_name = name.type.to_string();
-        if (!seen.emplace(type_name, name.entry).second) continue;
-        TableFlattenerOptions::LegacyPublicEntry entry;
-        entry.type_name = type_name;
-        entry.entry_name = name.entry;
-        entry.type_id = (id.id >> 16) & 0xFF;
-        entry.entry_id = id.id & 0xFFFF;
-        legacy_entries_.push_back(std::move(entry));
-        ++added;
-      }
-      if (added > 0) {
-        context_->GetDiagnostics()->Note(android::DiagMessage()
-            << "auto-legacy-from-include: " << added
-            << " 0x7F entries derived from -I (packageId=0x7F)");
-      }
+      aura::LegacyPackageCollector::AutoDeriveFromIncludes(
+          asset_source.get(), &legacy_entries_, context_->GetDiagnostics());
     }
 
     context_->GetExternalSymbols()->AppendSource(std::move(asset_source));
@@ -1438,82 +1367,13 @@ class Linker {
       return false;
     }
 
-    // 追加 --public AAR 中 R.txt 的内容到宿主 R.txt：
-    // 让 AGP 后续 R.jar 生成步骤包含上游 public 资源字段，
-    // 替代 Gradle 端 stub res 注入路径。
-    //
-    // 仅在 fout_text 存在（即生成 R.txt）且当前在生成"主包"R 类时追加，
-    // 避免在 generate_text_symbols 之外的场景或非主包遍历时重复追加。
+    // 追加 --public AAR 中 R.txt 的内容到宿主 R.txt
     if (fout_text != nullptr &&
-        !merged_public_rtxt_content_.empty() &&
+        !public_aar_data_.merged_rtxt_content.empty() &&
         package_name_to_generate == context_->GetCompilationPackage()) {
-      // 收集已写入的 (type, name) 集合用于去重——上游 R.txt 与当前 ResourceTable
-      // 可能含同名 entry（来自 stub res 注入）。同名时保留宿主已有，跳过上游。
-      std::set<std::pair<std::string, std::string>> seen;
-      for (const auto& package : table->packages) {
-        if (package->name != context_->GetCompilationPackage()) continue;
-        for (const auto& type : package->types) {
-          std::string type_name = type->named_type.to_string();
-          for (const auto& entry : type->entries) {
-            seen.emplace(type_name, entry->name);
-          }
-        }
-      }
-
-      // 用 text::Printer 写入 fout_text，保持与 JavaClassGenerator 相同的写入路径
-      text::Printer rtxt_printer(fout_text.get());
-
-      // 解析合并的 R.txt 内容，按行去重写入
-      std::istringstream input(merged_public_rtxt_content_);
-      std::string line;
-      // styleable 上下文：当前 styleable 的 name 是否已被去重决定
-      bool skip_styleable_context = false;
-      size_t appended = 0;
-      while (std::getline(input, line)) {
-        if (line.empty()) continue;
-        // R.txt 行类型：
-        //   "int <type> <name> 0x..."         普通条目
-        //   "int[] styleable <name> { ... }"  styleable 数组（顶层）
-        //   "int styleable <name>_<attr> N"   styleable 子索引
-        bool skip_this = false;
-        if (line.compare(0, 4, "int ") == 0) {
-          std::istringstream ls(line);
-          std::string kind, type, name;
-          ls >> kind >> type >> name;
-          if (type.empty() || name.empty()) {
-            skip_this = true;
-          } else if (type == "styleable") {
-            // 子索引依附于上一条 int[] styleable 数组，是否跳过取决于上下文
-            if (skip_styleable_context) skip_this = true;
-          } else {
-            // 普通条目去重
-            if (seen.count(std::make_pair(type, name)) > 0) {
-              skip_this = true;
-            } else {
-              seen.emplace(type, name);
-            }
-          }
-        } else if (line.compare(0, 6, "int[] ") == 0) {
-          // 顶层 styleable 数组：解析 name，去重整组
-          std::istringstream ls(line);
-          std::string kind, type, name;
-          ls >> kind >> type >> name;
-          if (type == "styleable" && !name.empty()) {
-            skip_styleable_context =
-                seen.count(std::make_pair(std::string("styleable"), name)) > 0;
-            if (skip_styleable_context) {
-              skip_this = true;
-            } else {
-              seen.emplace(std::string("styleable"), name);
-            }
-          }
-        }
-        if (skip_this) continue;
-        rtxt_printer.Println(line);
-        ++appended;
-      }
-      context_->GetDiagnostics()->Note(android::DiagMessage()
-          << "merged " << appended << " R.txt lines from --public AAR(s) into host R.txt");
+      aura::PublicRtxtMerger::Append(public_aar_data_.merged_rtxt_content,
+                                     context_->GetCompilationPackage(),
+                                     table, fout_text.get(), context_->GetDiagnostics());
     }
 
     return true;
@@ -2187,33 +2047,14 @@ class Linker {
           options_.arsc_package_name.value_or(context_->GetCompilationPackage());
     }
 
-    // --arsc-package-name：仅覆盖 arsc 中 PackageChunk 的 package name，
-    // 不影响 manifest、R 类生成和资源引用解析。
-    // 在 FlattenTable 前临时修改，flatten 后改回（与 feature split 重写模式一致）。
-    std::string original_package_name;
-    ResourceTablePackage* arsc_name_rewrite_pkg = nullptr;
-    if (options_.arsc_package_name) {
-      for (auto& pkg : table->packages) {
-        if (pkg->name == context_->GetCompilationPackage()) {
-          arsc_name_rewrite_pkg = pkg.get();
-          original_package_name = pkg->name;
-          pkg->name = options_.arsc_package_name.value();
-          if (context_->IsVerbose()) {
-            context_->GetDiagnostics()->Note(
-                android::DiagMessage() << "overriding arsc package name to '"
-                                       << options_.arsc_package_name.value() << "'");
-          }
-          break;
-        }
-      }
-    }
+    // --arsc-package-name：RAII 方式临时覆盖 arsc 中 PackageChunk 的 package name
+    aura::ArscPackageNameRewriter arsc_name_rewriter(
+        options_.arsc_package_name, context_->GetCompilationPackage(),
+        table, context_->GetDiagnostics());
 
     bool success = FlattenTable(table, options_.output_format, writer);
 
-    // 恢复 package name
-    if (arsc_name_rewrite_pkg != nullptr) {
-      arsc_name_rewrite_pkg->name = original_package_name;
-    }
+    // arsc_name_rewriter 析构时自动恢复 package name
 
     if (package_to_rewrite != nullptr) {
       // Change the name back.
@@ -2429,100 +2270,15 @@ class Linker {
         }
       }
 
-      // IdAssigner 只分配 non-legacy entry 的 ID，不产生碰撞
-      // 注意：shadow 标记必须在 IdAssigner 之前完成，IdAssigner 才能跳过 shadow entry
-      // 不为它们分配 entry ID（避免占用 entry-slot-config 槽位）。
-      // 收集 shadow_set：union 自 --shadow-resources（type/name 文本）和 --public（public.aar 中的 R.txt）
-      std::set<std::pair<std::string, std::string>> shadow_set;
-      if (options_.shadow_resources_path) {
-        const std::string& path = options_.shadow_resources_path.value();
-        std::ifstream shadow_file(path);
-        if (!shadow_file.is_open()) {
-          context_->GetDiagnostics()->Error(android::DiagMessage()
-              << "failed to open --shadow-resources file: " << path);
+      // 读取 --public AAR 并标记 shadow 资源
+      if (!options_.public_aar_paths.empty()) {
+        if (!aura::PublicAarReader::Read(options_.public_aar_paths,
+                                         context_->GetDiagnostics(), &public_aar_data_)) {
           return 1;
         }
-        std::string line;
-        while (std::getline(shadow_file, line)) {
-          if (line.empty() || line[0] == '#') continue;
-          auto slash = line.find('/');
-          if (slash == std::string::npos) continue;
-          shadow_set.emplace(line.substr(0, slash), line.substr(slash + 1));
-        }
-      }
-      // --public：直接传 public.aar，aapt2 解压读 R.txt 自动提取 (type, name)
-      // R.txt 格式：每行 "int <type> <name> <hex_id>"（normal）或
-      // "int[] styleable <name> { ... }"（styleable 整体），后者跳过
-      for (const std::string& aar_path : options_.public_aar_paths) {
-        std::string err;
-        auto aar = io::ZipFileCollection::Create(aar_path, &err);
-        if (!aar) {
-          context_->GetDiagnostics()->Error(android::DiagMessage()
-              << "failed to open --public AAR " << aar_path << ": " << err);
-          return 1;
-        }
-        io::IFile* r_txt_file = aar->FindFile("R.txt");
-        if (!r_txt_file) {
-          context_->GetDiagnostics()->Warn(android::DiagMessage()
-              << "--public AAR " << aar_path << " does not contain R.txt, skipping");
-          continue;
-        }
-        auto r_txt_data = r_txt_file->OpenAsData();
-        if (!r_txt_data) {
-          context_->GetDiagnostics()->Error(android::DiagMessage()
-              << "failed to read R.txt from --public AAR " << aar_path);
-          return 1;
-        }
-        std::string r_txt_content(static_cast<const char*>(r_txt_data->data()),
-                                  r_txt_data->size());
-
-        // 保存原始 R.txt 内容，在 R.txt 输出阶段追加到宿主 R.txt。
-        // 包含所有行类型（int / int[] styleable / styleable 子索引），让 AGP 后续
-        // R.jar 生成步骤直接看到上游 public 资源字段，无需 Gradle 端 stub res 注入。
-        if (!r_txt_content.empty()) {
-          if (!merged_public_rtxt_content_.empty() &&
-              merged_public_rtxt_content_.back() != '\n') {
-            merged_public_rtxt_content_ += '\n';
-          }
-          merged_public_rtxt_content_ += r_txt_content;
-        }
-
-        std::istringstream r_txt_stream(r_txt_content);
-        std::string line;
-        size_t aar_count = 0;
-        while (std::getline(r_txt_stream, line)) {
-          if (line.empty()) continue;
-          // 跳过 styleable 数组与子索引（不是 ResourceTable 中的真实 entry）
-          if (line.compare(0, 4, "int ") != 0) continue;
-          // "int <type> <name> 0x..."
-          std::istringstream ls(line);
-          std::string kind, type, name;
-          ls >> kind >> type >> name;
-          if (type.empty() || name.empty()) continue;
-          if (type == "styleable") continue;  // 不是 entry，跳过
-          shadow_set.emplace(type, name);
-          ++aar_count;
-        }
-        context_->GetDiagnostics()->Note(android::DiagMessage()
-            << "--public: " << aar_count << " entries from " << aar_path);
-      }
-      // 应用 shadow_set 到 ResourceTable：标记当前包中匹配的 entry 为 shadow
-      if (!shadow_set.empty()) {
-        size_t marked_count = 0;
-        for (auto& package : final_table_.packages) {
-          if (package->name != context_->GetCompilationPackage()) continue;
-          for (auto& type : package->types) {
-            const std::string type_name = type->named_type.to_string();
-            for (auto& entry : type->entries) {
-              if (shadow_set.count(std::make_pair(type_name, entry->name))) {
-                entry->is_shadow = true;
-                ++marked_count;
-              }
-            }
-          }
-        }
-        context_->GetDiagnostics()->Note(android::DiagMessage()
-            << "shadow resources: " << marked_count << " entries marked");
+        aura::ShadowResourceMarker::Mark(public_aar_data_.shadow_set,
+                                          context_->GetCompilationPackage(),
+                                          &final_table_, context_->GetDiagnostics());
       }
 
       IdAssigner id_assigner(
@@ -2580,40 +2336,10 @@ class Linker {
             << "restored " << restored << " legacy entries with declared IDs");
       }
 
-      // 为仍未在 final_table_ 中出现的 legacy entries 合成占位条目。
-      // 当宿主未生成 stub 资源时，legacy entries 不会出现在 table 中，
-      // ReferenceLinker 将无法解析对它们的引用（如 @style/Theme.AppCompat.Light）。
-      // 合成空 entry（无 values，设 ID 和 public visibility）使 ReferenceLinker 能找到它们。
-      // 对于 attr 类型，SymbolTable 检测到空 entry 后回退到 AssetManagerSymbolSource
-      // （由 -I 传入的 bundle 提供完整 Attribute 格式信息）。
-      if (!legacy_entries_.empty()) {
-        auto* host_package = final_table_.FindOrCreatePackage(
-            context_->GetCompilationPackage());
-        size_t synthesized = 0;
-        for (const auto& le : legacy_entries_) {
-          auto parsed_type = ParseResourceNamedType(le.type_name);
-          if (!parsed_type) {
-            continue;
-          }
-          auto* type = host_package->FindOrCreateType(parsed_type.value());
-          ResourceEntry* existing = type->FindEntry(le.entry_name);
-          if (existing != nullptr) {
-            // 已存在（由 stub 或恢复流程创建），跳过
-            continue;
-          }
-          // 合成空占位 entry（visibility 保持 kUndefined 以避免
-          // ReferenceLinker 的 "no definition for declared symbol" 完整性检查。
-          // --disable-visibility-check 默认 true，确保引用仍可解析。）
-          ResourceEntry* entry = type->FindOrCreateEntry(le.entry_name);
-          entry->id = ResourceId(kAppPackageId, le.type_id, le.entry_id);
-          synthesized++;
-        }
-        if (synthesized > 0) {
-          context_->GetDiagnostics()->Note(android::DiagMessage()
-              << "synthesized " << synthesized
-              << " phantom legacy entries for ReferenceLinker");
-        }
-      }
+      // 为仍未在 final_table_ 中出现的 legacy entries 合成占位条目
+      aura::PhantomEntrySynthesizer::Synthesize(
+          legacy_entries_, context_->GetCompilationPackage(),
+          &final_table_, context_->GetDiagnostics());
 
       // Now grab each ID and emit it as a file.
       if (options_.resource_id_map_path) {
@@ -2929,10 +2655,8 @@ class Linker {
   std::vector<int> entry_slots_;
   // 解析后的 legacy 0x7F 资源条目
   std::vector<TableFlattenerOptions::LegacyPublicEntry> legacy_entries_;
-  // 通过 --public 传入的所有 AAR 中 R.txt 的原始内容（按 AAR 顺序拼接，含 styleable 行）。
-  // 在 R.txt 输出阶段追加到宿主 R.txt，让 AGP 后续 R.jar 生成步骤包含上游 public 资源字段，
-  // 替代 Gradle 端 stub res 注入路径。
-  std::string merged_public_rtxt_content_;
+  // --public AAR 读取结果（shadow_set + merged R.txt content）
+  aura::PublicAarData public_aar_data_;
 };
 
 int LinkCommand::Action(const std::vector<std::string>& args) {

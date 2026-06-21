@@ -19,6 +19,12 @@ package {
 }
 
 toolSources = [
+    "aura/ArscPackageNameRewriter.cpp",
+    "aura/LegacyPackageCollector.cpp",
+    "aura/PhantomEntrySynthesizer.cpp",
+    "aura/PublicAarReader.cpp",
+    "aura/PublicRtxtMerger.cpp",
+    "aura/ShadowResourceMarker.cpp",
     "cmd/ApkInfo.cpp",
     "cmd/Command.cpp",
     "cmd/Compile.cpp",

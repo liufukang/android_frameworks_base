@@ -124,15 +124,6 @@ class SymbolTable {
     return include_package_names_;
   }
 
-  // 设置是否禁用资源可见性检查（默认 true，允许引用非 PUBLIC 资源）
-  void SetDisableVisibilityCheck(bool val) {
-    disable_visibility_check_ = val;
-  }
-
-  bool GetDisableVisibilityCheck() const {
-    return disable_visibility_check_;
-  }
-
  private:
   NameMangler* mangler_;
   std::unique_ptr<ISymbolTableDelegate> delegate_;
@@ -146,9 +137,6 @@ class SymbolTable {
   // 跨包非限定资源引用回退搜索配置
   bool search_all_include_packages_ = false;
   std::vector<std::string> include_package_names_;
-
-  // 禁用资源可见性检查（默认 false，需通过 --disable-visibility-check 显式开启）
-  bool disable_visibility_check_ = false;
 
   DISALLOW_COPY_AND_ASSIGN(SymbolTable);
 };
