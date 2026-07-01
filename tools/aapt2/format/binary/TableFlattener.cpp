@@ -615,10 +615,38 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
   ChunkWriter table_writer(buffer_);
   ResTable_header* table_header = table_writer.StartChunk<ResTable_header>(RES_TABLE_TYPE);
 
-  // 计算 packageCount：table_view.packages 包含所有 PackageView（含宿主 0x7F），
-  // 如果有 legacy entries，FlattenLegacyPackage 会额外输出一个 0x7F legacy PackageChunk，
-  // 因此总 packageCount = table_view.packages.size() + 1。
-  uint32_t total_packages = table_view.packages.size();
+  // 判定 PackageView 在 legacy_entries 过滤后是否仍有实际 entry。
+  // 用于同时校准 packageCount 与后续 flatten 循环的跳过条件。
+  // 场景：bundle packageId != 0x7F + --legacy-public-xml 时，
+  //   PhantomEntrySynthesizer 会为未在 final_table_ 中出现的 legacy entry
+  //   合成 id=0x7F.. 的占位条目，GetPartitionedView 把它们拆到独立的 0x7F
+  //   PackageView；这些占位条目全部在 legacy_entries 过滤名单中，过滤后
+  //   该 PackageView 的所有 type 都变成空 entries（仅剩 17 个空 TypeSpec 骨架）。
+  //   此类空壳不承载任何资源信息，且真实数据已由 FlattenLegacyPackage 输出，
+  //   故直接跳过；对普通场景（无 legacy_entries、或过滤后仍有 entry）无副作用。
+  auto package_has_entries = [&](const ResourceTablePackageView& pkg) -> bool {
+    if (options_.legacy_entries.empty()) return true;
+    std::set<std::pair<std::string, std::string>> legacy_names;
+    for (const auto& le : options_.legacy_entries) {
+      legacy_names.insert({le.type_name, le.entry_name});
+    }
+    for (const auto& type : pkg.types) {
+      std::string type_name = type.named_type.to_string();
+      for (const auto& entry : type.entries) {
+        if (legacy_names.count({type_name, std::string(entry.name)}) == 0) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
+  // 计算 packageCount：非空 PackageView + 可选的 legacy PackageChunk。
+  uint32_t non_empty_view_count = 0;
+  for (const auto& package : table_view.packages) {
+    if (package_has_entries(package)) non_empty_view_count++;
+  }
+  uint32_t total_packages = non_empty_view_count;
   if (!options_.legacy_entries.empty()) {
     total_packages += 1;  // FlattenLegacyPackage 额外输出的 legacy PackageChunk
   }
@@ -668,6 +696,13 @@ bool TableFlattener::Consume(IAaptContext* context, ResourceTable* table) {
 
   // Flatten each package (legacy entries 已从各 PackageView 中过滤).
   for (auto& package : table_view.packages) {
+    // 跳过过滤后无实际 entry 的 PackageView（PhantomEntrySynthesizer 造成的空 0x7F 残壳）。
+    // packageCount 已在 header 阶段同步扣减，此处仅需省略 flatten。
+    bool has_entries = std::any_of(
+        package.types.begin(), package.types.end(),
+        [](const ResourceTableTypeView& t) { return !t.entries.empty(); });
+    if (!has_entries) continue;
+
     if (context->GetPackageType() == PackageType::kApp) {
       // Write a self mapping entry for this package if the ID is non-standard (0x7f).
       CHECK((bool)package.id) << "Resource ids have not been assigned before flattening the table";
