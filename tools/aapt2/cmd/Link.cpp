@@ -1367,11 +1367,11 @@ class Linker {
       return false;
     }
 
-    // 追加 --public AAR 中 R.txt 的内容到宿主 R.txt
+    // 追加 --shadow-ids R.txt 的内容到宿主 R.txt
     if (fout_text != nullptr &&
-        !public_aar_data_.merged_rtxt_content.empty() &&
+        !shadow_ids_data_.merged_rtxt_content.empty() &&
         package_name_to_generate == context_->GetCompilationPackage()) {
-      aura::PublicRtxtMerger::Append(public_aar_data_.merged_rtxt_content,
+      aura::PublicRtxtMerger::Append(shadow_ids_data_.merged_rtxt_content,
                                      context_->GetCompilationPackage(),
                                      table, fout_text.get(), context_->GetDiagnostics());
     }
@@ -2271,12 +2271,12 @@ class Linker {
       }
 
       // 读取 --public AAR 并标记 shadow 资源
-      if (!options_.public_aar_paths.empty()) {
-        if (!aura::PublicAarReader::Read(options_.public_aar_paths,
-                                         context_->GetDiagnostics(), &public_aar_data_)) {
+      if (!options_.shadow_ids_paths.empty()) {
+        if (!aura::ShadowIdsReader::Read(options_.shadow_ids_paths,
+                                         context_->GetDiagnostics(), &shadow_ids_data_)) {
           return 1;
         }
-        aura::ShadowResourceMarker::Mark(public_aar_data_.shadow_set,
+        aura::ShadowResourceMarker::Mark(shadow_ids_data_.shadow_set,
                                           context_->GetCompilationPackage(),
                                           &final_table_, context_->GetDiagnostics());
       }
@@ -2655,8 +2655,8 @@ class Linker {
   std::vector<int> entry_slots_;
   // 解析后的 legacy 0x7F 资源条目
   std::vector<TableFlattenerOptions::LegacyPublicEntry> legacy_entries_;
-  // --public AAR 读取结果（shadow_set + merged R.txt content）
-  aura::PublicAarData public_aar_data_;
+  // --shadow-ids 读取结果（shadow_set + merged R.txt content）
+  aura::ShadowIdsData shadow_ids_data_;
 };
 
 int LinkCommand::Action(const std::vector<std::string>& args) {

@@ -138,10 +138,10 @@ struct LinkOptions {
   // arsc 中 PackageChunk 的 package name 覆盖值（不影响 manifest 和 R 类）
   std::optional<std::string> arsc_package_name;
 
-  // Public AAR 文件路径列表：bundleDeps 暴露的 public.aar（含 R.txt）。
-  // aapt2 解压读 R.txt，提取 (type, name) 作为 shadow resources，
+  // --shadow-ids R.txt 文件路径列表：已过滤的 bundleDeps R.txt。
+  // aapt2 直接读取文本文件，提取 (type, name) 作为 shadow resources，
   // 并将 R.txt 内容合并到宿主 R.txt 输出。
-  std::vector<std::string> public_aar_paths;
+  std::vector<std::string> shadow_ids_paths;
 };
 
 class LinkCommand : public Command {
@@ -393,12 +393,12 @@ class LinkCommand : public Command {
                     "Override the package name written to PackageChunk in resources.arsc.\n"
                     "Does not affect AndroidManifest.xml or R class generation.",
                     &options_.arsc_package_name);
-    AddOptionalFlagList("--public",
-                    "Path to a public.aar file (bundleDeps exported API).\n"
-                    "aapt2 reads R.txt inside the AAR and extracts (type, name) as shadow\n"
+    AddOptionalFlagList("--shadow-ids",
+                    "Path to a filtered R.txt file (bundleDeps shadow resources).\n"
+                    "aapt2 reads the R.txt and extracts (type, name) as shadow\n"
                     "resources, and merges R.txt content into host R.txt output.\n"
                     "Can be specified multiple times for multiple bundleDeps.",
-                    &options_.public_aar_paths, Command::kPath);
+                    &options_.shadow_ids_paths, Command::kPath);
   }
 
   int Action(const std::vector<std::string>& args) override;

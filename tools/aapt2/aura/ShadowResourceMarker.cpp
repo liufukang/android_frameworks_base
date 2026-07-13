@@ -21,7 +21,8 @@ size_t ShadowResourceMarker::Mark(
     for (auto& type : package->types) {
       const std::string type_name = type->named_type.to_string();
       for (auto& entry : type->entries) {
-        if (shadow_set.count(std::make_pair(type_name, entry->name))) {
+        auto key = std::make_pair(type_name, entry->name);
+        if (shadow_set.count(key)) {
           entry->is_shadow = true;
           ++marked_count;
         }

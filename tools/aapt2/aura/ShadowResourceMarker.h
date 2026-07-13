@@ -16,7 +16,7 @@
 namespace aapt {
 namespace aura {
 
-// 接收 shadow_set（来自 PublicAarReader），标记 ResourceTable 中当前 compilation package
+// 接收 shadow_set（来自 ShadowIdsReader），标记 ResourceTable 中当前 compilation package
 // 匹配的 entry 为 is_shadow=true。shadow entry 在 IdAssigner 中走无 slot 约束分配，
 // TableFlattener 不写入 arsc，ReferenceLinker 跳过本地查找走 -I 真实 ID。
 class ShadowResourceMarker {
