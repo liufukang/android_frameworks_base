@@ -72,8 +72,15 @@ struct TypeGroup {
   explicit TypeGroup(uint8_t package_id, uint8_t type_id)
       : package_id_(package_id), type_id_(type_id){};
 
-  // 设置 entry ID slot 校验器
-  void SetEntrySlots(const std::vector<int>* entry_slots, int slot_size) {
+  // 设置 entry ID slot 校验器。
+  // phantom type（styleable/macro）不 flatten 进 arsc，其 entry_id 仅用于 R.txt/引用解析，
+  // 不占用 arsc 的 entry 空间，因此**不受 entry-slot 分区约束**——否则当 entrySlots 收窄
+  // （如 [0]+size=128）时，数量众多的 styleable（含 bundleDeps/jdlib 引入的）会因合法 entry
+  // 仅剩 0~127 而迅速耗尽，报 "exceeded the maximum number of resource entries (65536)"。
+  void SetEntrySlots(const std::vector<int>* entry_slots, int slot_size, bool is_phantom) {
+    if (is_phantom) {
+      return;  // phantom type 不套 slot 约束
+    }
     if (entry_slots && !entry_slots->empty()) {
       next_entry_id_.SetIdValidator([entry_slots, slot_size](uint16_t id) -> bool {
         int slot = id / slot_size;
@@ -395,8 +402,10 @@ bool IdAssignerContext::ReserveId(const ResourceName& name, ResourceId id,
       return false;
     }
     type = types_.emplace(key, TypeGroup(package_id_, id.type_id())).first;
-    // 为新创建的 TypeGroup 设置 entry slot 校验
-    type->second.SetEntrySlots(entry_slots_, entry_slot_size_);
+    // 为新创建的 TypeGroup 设置 entry slot 校验（phantom type 不套约束）
+    bool is_phantom = name.type.type == ResourceType::kStyleable ||
+                      name.type.type == ResourceType::kMacro;
+    type->second.SetEntrySlots(entry_slots_, entry_slot_size_, is_phantom);
   }
 
   if (!visibility.staged_api) {
@@ -480,8 +489,10 @@ std::optional<ResourceId> IdAssignerContext::NextId(const ResourceName& name,
   auto type = types_.find(key);
   if (type == types_.end()) {
     type = types_.emplace(key, TypeGroup(package_id_, key.id)).first;
-    // 为新创建的 TypeGroup 设置 entry slot 校验
-    type->second.SetEntrySlots(entry_slots_, entry_slot_size_);
+    // 为新创建的 TypeGroup 设置 entry slot 校验（phantom type 不套约束）
+    bool is_phantom = name.type.type == ResourceType::kStyleable ||
+                      name.type.type == ResourceType::kMacro;
+    type->second.SetEntrySlots(entry_slots_, entry_slot_size_, is_phantom);
   }
 
   auto assign_result = type->second.NextId();
